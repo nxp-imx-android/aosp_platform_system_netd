@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <spawn.h>
 #include <sys/types.h>
@@ -31,11 +32,15 @@
 #include <log/log.h>
 
 #include "android-base/unique_fd.h"
+#include "bpf/BpfMap.h"
+#include "netdbpf/bpf_shared.h"
+#include "netdutils/DumpWriter.h"
 
 extern "C" {
 #include "netutils/checksum.h"
 }
 
+#include "ClatUtils.h"
 #include "Fwmark.h"
 #include "NetdConstants.h"
 #include "NetworkController.h"
@@ -50,6 +55,9 @@ static const in_addr kV4Addr = {inet_addr(kV4AddrString)};
 static const int kV4AddrLen = 29;
 
 using android::base::unique_fd;
+using android::bpf::BpfMap;
+using android::netdutils::DumpWriter;
+using android::netdutils::ScopedIndent;
 
 namespace android {
 namespace net {
@@ -186,6 +194,7 @@ int ClatdController::ClatdTracker::init(const std::string& interface,
 
     snprintf(fwmarkString, sizeof(fwmarkString), "0x%x", fwmark.intValue);
     snprintf(netIdString, sizeof(netIdString), "%u", netId);
+    ifIndex = if_nametoindex(interface.c_str());
     strlcpy(iface, interface.c_str(), sizeof(iface));
 
     // Pass in everything that clatd needs: interface, a netid to use for DNS lookups, a fwmark for
@@ -193,19 +202,19 @@ int ClatdController::ClatdTracker::init(const std::string& interface,
     // Validate the prefix and strip off the prefix length.
     uint8_t family;
     uint8_t prefixLen;
-    int res = parsePrefix(nat64Prefix.c_str(), &family, &dst, sizeof(dst), &prefixLen);
+    int res = parsePrefix(nat64Prefix.c_str(), &family, &pfx96, sizeof(pfx96), &prefixLen);
     // clatd only supports /96 prefixes.
-    if (res != sizeof(dst)) return res;
+    if (res != sizeof(pfx96)) return res;
     if (family != AF_INET6) return -EAFNOSUPPORT;
     if (prefixLen != 96) return -EINVAL;
-    if (!inet_ntop(AF_INET6, &dst, dstString, sizeof(dstString))) return -errno;
+    if (!inet_ntop(AF_INET6, &pfx96, pfx96String, sizeof(pfx96String))) return -errno;
 
     // Pick an IPv4 address.
     // TODO: this picks the address based on other addresses that are assigned to interfaces, but
     // the address is only actually assigned to an interface once clatd starts up. So we could end
     // up with two clatd instances with the same IPv4 address.
     // Stop doing this and instead pick a free one from the kV4Addr pool.
-    in_addr v4 = {selectIpv4Address(kV4Addr, kV4AddrLen)};
+    v4 = {selectIpv4Address(kV4Addr, kV4AddrLen)};
     if (v4.s_addr == INADDR_NONE) {
         ALOGE("No free IPv4 address in %s/%d", kV4AddrString, kV4AddrLen);
         return -EADDRNOTAVAIL;
@@ -213,13 +222,13 @@ int ClatdController::ClatdTracker::init(const std::string& interface,
     if (!inet_ntop(AF_INET, &v4, v4Str, sizeof(v4Str))) return -errno;
 
     // Generate a checksum-neutral IID.
-    if (generateIpv6Address(iface, v4, dst, &v6)) {
-        ALOGE("Unable to find global source address on %s for %s", iface, dstString);
+    if (generateIpv6Address(iface, v4, pfx96, &v6)) {
+        ALOGE("Unable to find global source address on %s for %s", iface, pfx96String);
         return -EADDRNOTAVAIL;
     }
     if (!inet_ntop(AF_INET6, &v6, v6Str, sizeof(v6Str))) return -errno;
 
-    ALOGD("starting clatd on %s v4=%s v6=%s dst=%s", iface, v4Str, v6Str, dstString);
+    ALOGD("starting clatd on %s v4=%s v6=%s pfx96=%s", iface, v4Str, v6Str, pfx96String);
     return 0;
 }
 
@@ -245,7 +254,7 @@ int ClatdController::startClatd(const std::string& interface, const std::string&
                     (char*) "-i", tracker.iface,
                     (char*) "-n", tracker.netIdString,
                     (char*) "-m", tracker.fwmarkString,
-                    (char*) "-p", tracker.dstString,
+                    (char*) "-p", tracker.pfx96String,
                     (char*) "-4", tracker.v4Str,
                     (char*) "-6", tracker.v6Str,
                     nullptr};
@@ -283,6 +292,56 @@ int ClatdController::stopClatd(const std::string& interface) {
     ALOGD("clatd on %s stopped", interface.c_str());
 
     return 0;
+}
+
+void ClatdController::dump(DumpWriter& dw) {
+    std::lock_guard guard(mutex);
+
+    ScopedIndent clatdIndent(dw);
+    dw.println("ClatdController");
+
+    {
+        ScopedIndent trackerIndent(dw);
+        dw.println("Trackers: iif[iface] nat64Prefix v6Addr -> v4Addr [netId]");
+
+        ScopedIndent trackerDetailIndent(dw);
+        for (const auto& pair : mClatdTrackers) {
+            const ClatdTracker& tracker = pair.second;
+            dw.println("%u[%s] %s/96 %s -> %s [%u]", tracker.ifIndex, tracker.iface,
+                       tracker.pfx96String, tracker.v6Str, tracker.v4Str, tracker.netId);
+        }
+    }
+
+    int mapFd = getClatIngressMapFd();
+    if (mapFd < 0) return;  // if unsupported just don't dump anything
+    BpfMap<ClatIngressKey, ClatIngressValue> configMap(mapFd);
+
+    ScopedIndent bpfIndent(dw);
+    dw.println("BPF ingress map: iif(iface) nat64Prefix v6Addr -> v4Addr oif(iface)");
+
+    ScopedIndent bpfDetailIndent(dw);
+    const auto printClatMap = [&dw](const ClatIngressKey& key, const ClatIngressValue& value,
+                                    const BpfMap<ClatIngressKey, ClatIngressValue>&) {
+        char iifStr[IFNAMSIZ] = "?";
+        char pfx96Str[INET6_ADDRSTRLEN] = "?";
+        char local6Str[INET6_ADDRSTRLEN] = "?";
+        char local4Str[INET_ADDRSTRLEN] = "?";
+        char oifStr[IFNAMSIZ] = "?";
+
+        if_indextoname(key.iif, iifStr);
+        inet_ntop(AF_INET6, &key.pfx96, pfx96Str, sizeof(pfx96Str));
+        inet_ntop(AF_INET6, &key.local6, local6Str, sizeof(local6Str));
+        inet_ntop(AF_INET, &value.local4, local4Str, sizeof(local4Str));
+        if_indextoname(value.oif, oifStr);
+
+        dw.println("%u(%s) %s/96 %s -> %s %u(%s)", key.iif, iifStr, pfx96Str, local6Str, local4Str,
+                   value.oif, oifStr);
+        return netdutils::status::ok;
+    };
+    auto res = configMap.iterateWithValue(printClatMap);
+    if (!isOk(res)) {
+        dw.println("Error printing BPF map: %s", res.msg().c_str());
+    }
 }
 
 auto ClatdController::isIpv4AddressFreeFunc = isIpv4AddressFree;
