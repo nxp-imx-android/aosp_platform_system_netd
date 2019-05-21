@@ -19,35 +19,37 @@
 #include <cinttypes>
 #include <numeric>
 #include <set>
+#include <string>
 #include <tuple>
 #include <vector>
 
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <binder/IPCThreadState.h>
+#include <binder/IServiceManager.h>
+#include <binder/Status.h>
 #include <cutils/properties.h>
+#include <json/value.h>
+#include <json/writer.h>
 #include <log/log.h>
+#include <netdutils/DumpWriter.h>
 #include <utils/Errors.h>
 #include <utils/String16.h>
 
-#include <binder/IPCThreadState.h>
-#include <binder/IServiceManager.h>
-
-#include <json/value.h>
-#include <json/writer.h>
-
+#include "BinderUtil.h"
 #include "Controllers.h"
 #include "InterfaceController.h"
 #include "NetdConstants.h"  // SHA256_SIZE
 #include "NetdNativeService.h"
 #include "NetdPermissions.h"
+#include "OemNetdListener.h"
 #include "Permission.h"
 #include "Process.h"
 #include "RouteController.h"
 #include "SockDiag.h"
 #include "UidRanges.h"
 #include "android/net/BnNetd.h"
-#include "netdutils/DumpWriter.h"
 #include "netid_client.h"  // NETID_UNSET
 
 using android::base::StringPrintf;
@@ -148,6 +150,12 @@ bool contains(const Vector<String16>& words, const String16& word) {
 
 }  // namespace
 
+NetdNativeService::NetdNativeService() {
+    // register log callback to BnNetd::logFunc
+    BnNetd::logFunc = std::bind(binderCallLogFn, std::placeholders::_1,
+                                [](const std::string& msg) { gLog.info("%s", msg.c_str()); });
+}
+
 status_t NetdNativeService::start() {
     IPCThreadState::self()->disableBackgroundScheduling(true);
     const status_t ret = BinderService<NetdNativeService>::publish();
@@ -157,38 +165,6 @@ status_t NetdNativeService::start() {
     sp<ProcessState> ps(ProcessState::self());
     ps->startThreadPool();
     ps->giveThreadPoolName();
-
-    // register log callback to BnNetd::logFunc
-    BnNetd::logFunc = [](const Json::Value& logTransaction) {
-        bool hasReturnArgs;
-        std::string output;
-        const Json::Value& inputArgs = logTransaction["input_args"];
-        const Json::Value& returnArgs = logTransaction["_aidl_return"];
-        Json::Value::Members member = inputArgs.getMemberNames();
-
-        hasReturnArgs = !returnArgs.empty();
-        output.append(logTransaction["method_name"].asString().c_str() + std::string("("));
-
-        // input args
-        Json::FastWriter fastWriter;
-        fastWriter.omitEndingLineFeed();
-        for (Json::Value::Members::iterator iter = member.begin(); iter != member.end(); ++iter) {
-            std::string value = fastWriter.write(inputArgs[(*iter).c_str()]);
-            if (value.empty()) value = std::string("null");
-            output.append(value);
-            if (iter != member.end() - 1) {
-                output.append(", ");
-            }
-        }
-        output.append(std::string(")"));
-        // return args
-        if (hasReturnArgs) {
-            output.append(StringPrintf(" -> (%s)", fastWriter.write(returnArgs).c_str()));
-        }
-        // duration time
-        output.append(StringPrintf(" <%sms>", logTransaction["duration_ms"].asString().c_str()));
-        gLog.info("%s", output.c_str());
-    };
 
     return android::OK;
 }
@@ -756,6 +732,11 @@ binder::Status NetdNativeService::wakeupDelInterface(const std::string& ifName,
     return asBinderStatus(gCtls->wakeupCtrl.delInterface(ifName, prefix, mark, mask));
 }
 
+binder::Status NetdNativeService::trafficSwapActiveStatsMap() {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+    return asBinderStatus(gCtls->trafficCtrl.swapActiveStatsMap());
+}
+
 binder::Status NetdNativeService::idletimerAddInterface(const std::string& ifName, int32_t timeout,
                                                         const std::string& classLabel) {
     NETD_LOCKING_RPC(gCtls->idletimerCtrl.lock, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
@@ -796,13 +777,13 @@ binder::Status NetdNativeService::strictUidCleartextPenalty(int32_t uid, int32_t
 
 binder::Status NetdNativeService::clatdStart(const std::string& ifName,
                                              const std::string& nat64Prefix, std::string* v6Addr) {
-    NETD_LOCKING_RPC(gCtls->clatdCtrl.mutex, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
+    ENFORCE_ANY_PERMISSION(PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
     int res = gCtls->clatdCtrl.startClatd(ifName.c_str(), nat64Prefix, v6Addr);
     return statusFromErrcode(res);
 }
 
 binder::Status NetdNativeService::clatdStop(const std::string& ifName) {
-    NETD_LOCKING_RPC(gCtls->clatdCtrl.mutex, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
+    ENFORCE_ANY_PERMISSION(PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
     int res = gCtls->clatdCtrl.stopClatd(ifName.c_str());
     return statusFromErrcode(res);
 }
@@ -848,10 +829,6 @@ binder::Status NetdNativeService::ipfwdRemoveInterfaceForward(const std::string&
 }
 
 namespace {
-std::string addSquareBrackets(const std::string& s) {
-    return "[" + s + "]";
-}
-
 std::string addCurlyBrackets(const std::string& s) {
     return "{" + s + "}";
 }
@@ -860,18 +837,13 @@ std::string addCurlyBrackets(const std::string& s) {
 
 binder::Status NetdNativeService::interfaceGetList(std::vector<std::string>* interfaceListResult) {
     NETD_LOCKING_RPC(InterfaceController::mutex, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
-    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__);
-
     const auto& ifaceList = InterfaceController::getIfaceNames();
-    RETURN_BINDER_STATUS_IF_NOT_OK(entry, ifaceList);
 
     interfaceListResult->clear();
     interfaceListResult->reserve(ifaceList.value().size());
     interfaceListResult->insert(end(*interfaceListResult), begin(ifaceList.value()),
                                 end(ifaceList.value()));
 
-    gLog.log(entry.returns(addSquareBrackets(base::Join(*interfaceListResult, ", ")))
-                     .withAutomaticDuration());
     return binder::Status::ok();
 }
 
@@ -1116,9 +1088,7 @@ binder::Status NetdNativeService::networkCanProtect(int32_t uid, bool* ret) {
 binder::Status NetdNativeService::trafficSetNetPermForUids(int32_t permission,
                                                            const std::vector<int32_t>& uids) {
     ENFORCE_NETWORK_STACK_PERMISSIONS();
-    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__).arg(permission).arg(uids);
     gCtls->trafficCtrl.setPermissionForUids(permission, intsToUids(uids));
-    gLog.log(entry.withAutomaticDuration());
     return binder::Status::ok();
 }
 
@@ -1157,6 +1127,21 @@ binder::Status NetdNativeService::firewallEnableChildChain(int32_t childChain, b
     return statusFromErrcode(res);
 }
 
+binder::Status NetdNativeService::firewallAddUidInterfaceRules(const std::string& ifName,
+                                                               const std::vector<int32_t>& uids) {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    return asBinderStatus(gCtls->trafficCtrl.addUidInterfaceRules(
+            RouteController::getIfIndex(ifName.c_str()), uids));
+}
+
+binder::Status NetdNativeService::firewallRemoveUidInterfaceRules(
+        const std::vector<int32_t>& uids) {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+
+    return asBinderStatus(gCtls->trafficCtrl.removeUidInterfaceRules(uids));
+}
+
 binder::Status NetdNativeService::tetherAddForward(const std::string& intIface,
                                                    const std::string& extIface) {
     NETD_LOCKING_RPC(gCtls->tetherCtrl.lock, PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK);
@@ -1190,9 +1175,14 @@ binder::Status NetdNativeService::setTcpRWmemorySize(const std::string& rmemValu
 binder::Status NetdNativeService::registerUnsolicitedEventListener(
         const android::sp<android::net::INetdUnsolicitedEventListener>& listener) {
     ENFORCE_NETWORK_STACK_PERMISSIONS();
-    auto entry = gLog.newEntry().prettyFunction(__PRETTY_FUNCTION__);
     gCtls->eventReporter.registerUnsolEventListener(listener);
-    gLog.log(entry.withAutomaticDuration());
+    return binder::Status::ok();
+}
+
+binder::Status NetdNativeService::getOemNetd(android::sp<android::IBinder>* listener) {
+    ENFORCE_NETWORK_STACK_PERMISSIONS();
+    *listener = com::android::internal::net::OemNetdListener::getListener();
+
     return binder::Status::ok();
 }
 

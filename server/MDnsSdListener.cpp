@@ -525,7 +525,7 @@ MDnsSdListener::Monitor::Monitor() {
     mPollFds = nullptr;
     mPollRefs = nullptr;
     mPollSize = 10;
-    socketpair(AF_LOCAL, SOCK_STREAM, 0, mCtrlSocketPair);
+    socketpair(AF_LOCAL, SOCK_STREAM | SOCK_CLOEXEC, 0, mCtrlSocketPair);
 
     const int rval = ::android::netdutils::threadLaunch(this);
     if (rval != 0) {
@@ -752,4 +752,5 @@ void MDnsSdListener::Monitor::freeServiceRef(int id) {
 void MDnsSdListener::Monitor::deallocateServiceRef(DNSServiceRef* ref) {
     std::lock_guard guard(mMutex);
     DNSServiceRefDeallocate(*ref);
+    *ref = nullptr;
 }
