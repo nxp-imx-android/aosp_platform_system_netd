@@ -1,5 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
+/*
  * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +12,11 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-  package="com.android.resolv">
-  <!-- APEX does not have classes.dex -->
-  <application android:hasCode="false" />
-  <!--
-    * The interface between the resolver and netd is backwards compatible, so the resolver APEX
-    * can work with any version of netd.
-    -->
-  <uses-sdk
-      android:minSdkVersion="28"
-      android:targetSdkVersion="28"
-  />
-</manifest>
+ */
+
+#ifndef NETD_CLIENT_NETD_CLIENT_PRIV_H
+#define NETD_CLIENT_NETD_CLIENT_PRIV_H
+
+int getNetworkForDnsInternal(int fd, unsigned* dnsNetId);
+
+#endif  // NETD_CLIENT_NETD_CLIENT_PRIV_H
