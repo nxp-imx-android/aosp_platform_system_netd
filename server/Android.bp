@@ -5,7 +5,6 @@ aidl_interface {
     srcs: [
         "binder/android/net/metrics/INetdEventListener.aidl",
     ],
-    api_dir: "aidl/netdeventlistener",
     versions: ["1"],
 }
 
@@ -31,10 +30,11 @@ aidl_interface {
         // AIDL interface that callers can implement to receive networking events from netd.
         "binder/android/net/INetdUnsolicitedEventListener.aidl",
         "binder/android/net/InterfaceConfigurationParcel.aidl",
+        "binder/android/net/MarkMaskParcel.aidl",
+        "binder/android/net/TetherConfigParcel.aidl",
         "binder/android/net/TetherStatsParcel.aidl",
         "binder/android/net/UidRangeParcel.aidl",
     ],
-    api_dir: "aidl/netd",
     backend: {
         cpp: {
             gen_log: true,
@@ -104,9 +104,6 @@ cc_library_static {
         "netd_aidl_interface-cpp",
         "netd_event_listener_interface-cpp",
     ],
-    header_libs: [
-        "libnetd_resolv_headers",
-    ],
     aidl: {
         export_aidl_headers: true,
         local_include_dirs: ["binder"],
@@ -133,6 +130,7 @@ cc_binary {
         "libjsoncpp",
         "liblog",
         "libmdnssd",
+        "libnetd_resolv",
         "libnetdbpf",
         "libnetdutils",
         "libnetutils",
@@ -148,9 +146,6 @@ cc_binary {
     ],
     static_libs: [
         "libnetd_server",
-    ],
-    header_libs: [
-        "libnetd_resolv_headers",
     ],
     srcs: [
         "DummyNetwork.cpp",
@@ -168,7 +163,6 @@ cc_binary {
         "PhysicalNetwork.cpp",
         "PppController.cpp",
         "Process.cpp",
-        "ResolvStub.cpp",
         "VirtualNetwork.cpp",
         "main.cpp",
         "oem_iptables_hook.cpp",

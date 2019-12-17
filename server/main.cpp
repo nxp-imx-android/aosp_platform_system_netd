@@ -48,9 +48,9 @@
 #include "Process.h"
 
 #include "netd_resolv/resolv.h"
-#include "netd_resolv/resolv_stub.h"
 
 using android::IPCThreadState;
+using android::sp;
 using android::status_t;
 using android::String16;
 using android::net::FwmarkServer;
@@ -98,7 +98,7 @@ bool initDnsResolver() {
             .tagSocket = &tagSocketCallback,
             .evaluate_domain_name = &evaluateDomainNameCallback,
     };
-    return RESOLV_STUB.resolv_init(callbacks);
+    return resolv_init(&callbacks);
 }
 
 }  // namespace
@@ -117,9 +117,6 @@ int main() {
          {DNSPROXYLISTENER_SOCKET_NAME, FwmarkServer::SOCKET_NAME, MDnsSdListener::SOCKET_NAME}) {
         setCloseOnExec(sock);
     }
-
-    // Before we start any threads, populate the resolver stub pointers.
-    resolv_stub_init();
 
     // Make sure BPF programs are loaded before doing anything
     while (!android::base::WaitForProperty("bpf.progs_loaded", "1",
@@ -189,10 +186,9 @@ int main() {
 
     android::net::process::ScopedPidFile pidFile(PID_FILE_PATH);
 
-    // Now that netd is ready to process commands, advertise service
-    // availability for HAL clients.
-    NetdHwService mHwSvc;
-    if ((ret = mHwSvc.start()) != android::OK) {
+    // Now that netd is ready to process commands, advertise service availability for HAL clients.
+    sp<NetdHwService> mHwSvc(new NetdHwService());
+    if ((ret = mHwSvc->start()) != android::OK) {
         ALOGE("Unable to start NetdHwService: %d", ret);
         exit(1);
     }

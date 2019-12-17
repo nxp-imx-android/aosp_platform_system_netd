@@ -43,6 +43,7 @@
 #include <android-base/macros.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android/multinetwork.h>
 #include <binder/IPCThreadState.h>
 #include <bpf/BpfMap.h>
 #include <bpf/BpfUtils.h>
@@ -56,6 +57,7 @@
 #include "InterfaceController.h"
 #include "NetdClient.h"
 #include "NetdConstants.h"
+#include "NetworkController.h"
 #include "TestUnsolService.h"
 #include "XfrmController.h"
 #include "android/net/INetd.h"
@@ -91,6 +93,7 @@ using android::base::unique_fd;
 using android::net::INetd;
 using android::net::InterfaceConfigurationParcel;
 using android::net::InterfaceController;
+using android::net::MarkMaskParcel;
 using android::net::TetherStatsParcel;
 using android::net::TunInterface;
 using android::net::UidRangeParcel;
@@ -797,35 +800,39 @@ TEST_F(BinderTest, InterfaceAddRemoveAddress) {
     static const struct TestData {
         const char *addrString;
         const int   prefixLength;
-        const bool  expectSuccess;
+        const int expectAddResult;
+        const int expectRemoveResult;
     } kTestData[] = {
-        { "192.0.2.1", 24, true },
-        { "192.0.2.2", 25, true },
-        { "192.0.2.3", 32, true },
-        { "192.0.2.4", 33, false },
-        { "192.not.an.ip", 24, false },
-        { "2001:db8::1", 64, true },
-        { "2001:db8::2", 65, true },
-        { "2001:db8::3", 128, true },
-        { "2001:db8::4", 129, false },
-        { "foo:bar::bad", 64, false },
+            {"192.0.2.1", 24, 0, 0},
+            {"192.0.2.2", 25, 0, 0},
+            {"192.0.2.3", 32, 0, 0},
+            {"192.0.2.4", 33, EINVAL, EADDRNOTAVAIL},
+            {"192.not.an.ip", 24, EINVAL, EINVAL},
+            {"2001:db8::1", 64, 0, 0},
+            {"2001:db8::2", 65, 0, 0},
+            {"2001:db8::3", 128, 0, 0},
+            {"2001:db8::4", 129, EINVAL, EINVAL},
+            {"foo:bar::bad", 64, EINVAL, EINVAL},
+            {"2001:db8::1/64", 64, EINVAL, EINVAL},
     };
 
     for (size_t i = 0; i < std::size(kTestData); i++) {
         const auto &td = kTestData[i];
 
+        SCOPED_TRACE(String8::format("Offending IP address %s/%d", td.addrString, td.prefixLength));
+
         // [1.a] Add the address.
         binder::Status status = mNetd->interfaceAddAddress(
                 sTun.name(), td.addrString, td.prefixLength);
-        if (td.expectSuccess) {
+        if (td.expectAddResult == 0) {
             EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
         } else {
             ASSERT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
-            ASSERT_NE(0, status.serviceSpecificErrorCode());
+            ASSERT_EQ(td.expectAddResult, status.serviceSpecificErrorCode());
         }
 
         // [1.b] Verify the addition meets the expectation.
-        if (td.expectSuccess) {
+        if (td.expectAddResult == 0) {
             EXPECT_TRUE(interfaceHasAddress(sTun.name(), td.addrString, td.prefixLength));
         } else {
             EXPECT_FALSE(interfaceHasAddress(sTun.name(), td.addrString, -1));
@@ -833,16 +840,29 @@ TEST_F(BinderTest, InterfaceAddRemoveAddress) {
 
         // [2.a] Try to remove the address.  If it was not previously added, removing it fails.
         status = mNetd->interfaceDelAddress(sTun.name(), td.addrString, td.prefixLength);
-        if (td.expectSuccess) {
+        if (td.expectRemoveResult == 0) {
             EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
         } else {
             ASSERT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
-            ASSERT_NE(0, status.serviceSpecificErrorCode());
+            ASSERT_EQ(td.expectRemoveResult, status.serviceSpecificErrorCode());
         }
 
         // [2.b] No matter what, the address should not be present.
         EXPECT_FALSE(interfaceHasAddress(sTun.name(), td.addrString, -1));
     }
+
+    // Check that netlink errors are returned correctly.
+    // We do this by attempting to create an IPv6 address on an interface that has IPv6 disabled,
+    // which returns EACCES.
+    TunInterface tun;
+    ASSERT_EQ(0, tun.init());
+    binder::Status status =
+            mNetd->setProcSysNet(INetd::IPV6, INetd::CONF, tun.name(), "disable_ipv6", "1");
+    ASSERT_TRUE(status.isOk()) << status.exceptionMessage();
+    status = mNetd->interfaceAddAddress(tun.name(), "2001:db8::1", 64);
+    EXPECT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
+    EXPECT_EQ(EACCES, status.serviceSpecificErrorCode());
+    tun.destroy();
 }
 
 TEST_F(BinderTest, GetProcSysNet) {
@@ -1993,8 +2013,10 @@ TEST_F(BinderTest, TetherStartStopStatus) {
     static const char dnsdName[] = "dnsmasq";
 
     for (bool usingLegacyDnsProxy : {true, false}) {
-        binder::Status status =
-                mNetd->tetherStartWithConfiguration(usingLegacyDnsProxy, noDhcpRange);
+        android::net::TetherConfigParcel config;
+        config.usingLegacyDnsProxy = usingLegacyDnsProxy;
+        config.dhcpRanges = noDhcpRange;
+        binder::Status status = mNetd->tetherStartWithConfiguration(config);
         EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
         SCOPED_TRACE(StringPrintf("usingLegacyDnsProxy: %d", usingLegacyDnsProxy));
         if (usingLegacyDnsProxy == true) {
@@ -3228,4 +3250,60 @@ TEST_F(BinderTest, BypassableVPNFallthrough) {
     // Get current default network NetId
     ASSERT_TRUE(mNetd->networkGetDefault(&mStoredDefaultNetwork).isOk());
     expectVpnFallthroughWorks(mNetd.get(), true /* bypassable */, TEST_UID1, sTun, sTun2);
+}
+
+namespace {
+
+int32_t createIpv6SocketAndCheckMark(int type, const in6_addr& dstAddr) {
+    const sockaddr_in6 dst6 = {
+            .sin6_family = AF_INET6,
+            .sin6_port = 1234,
+            .sin6_addr = dstAddr,
+    };
+    // create non-blocking socket.
+    int sockFd = socket(AF_INET6, type | SOCK_NONBLOCK, 0);
+    EXPECT_NE(-1, sockFd);
+    EXPECT_EQ((type == SOCK_STREAM) ? -1 : 0, connect(sockFd, (sockaddr*)&dst6, sizeof(dst6)));
+
+    // Get socket fwmark.
+    Fwmark fwmark;
+    socklen_t fwmarkLen = sizeof(fwmark.intValue);
+    EXPECT_EQ(0, getsockopt(sockFd, SOL_SOCKET, SO_MARK, &fwmark.intValue, &fwmarkLen));
+    EXPECT_EQ(0, close(sockFd));
+    return fwmark.intValue;
+}
+
+}  // namespace
+
+TEST_F(BinderTest, GetFwmarkForNetwork) {
+    in6_addr v6Addr = {
+            {// 2001:db8:cafe::8888
+             .u6_addr8 = {0x20, 0x01, 0x0d, 0xb8, 0xca, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88}}};
+    // Add test physical network 1 and set as default network.
+    EXPECT_TRUE(mNetd->networkCreatePhysical(TEST_NETID1, INetd::PERMISSION_NONE).isOk());
+    EXPECT_TRUE(mNetd->networkAddInterface(TEST_NETID1, sTun.name()).isOk());
+    EXPECT_TRUE(mNetd->networkAddRoute(TEST_NETID1, sTun.name(), "2001:db8::/32", "").isOk());
+    EXPECT_TRUE(mNetd->networkSetDefault(TEST_NETID1).isOk());
+    // Add test physical network 2
+    EXPECT_TRUE(mNetd->networkCreatePhysical(TEST_NETID2, INetd::PERMISSION_NONE).isOk());
+    EXPECT_TRUE(mNetd->networkAddInterface(TEST_NETID2, sTun2.name()).isOk());
+
+    // Get fwmark for network 1.
+    MarkMaskParcel maskMarkNet1;
+    ASSERT_TRUE(mNetd->getFwmarkForNetwork(TEST_NETID1, &maskMarkNet1).isOk());
+
+    uint32_t fwmarkTcp = createIpv6SocketAndCheckMark(SOCK_STREAM, v6Addr);
+    uint32_t fwmarkUdp = createIpv6SocketAndCheckMark(SOCK_DGRAM, v6Addr);
+    EXPECT_EQ(maskMarkNet1.mark, static_cast<int>(fwmarkTcp & maskMarkNet1.mask));
+    EXPECT_EQ(maskMarkNet1.mark, static_cast<int>(fwmarkUdp & maskMarkNet1.mask));
+
+    // Get fwmark for network 2.
+    MarkMaskParcel maskMarkNet2;
+    ASSERT_TRUE(mNetd->getFwmarkForNetwork(TEST_NETID2, &maskMarkNet2).isOk());
+    EXPECT_NE(maskMarkNet2.mark, static_cast<int>(fwmarkTcp & maskMarkNet2.mask));
+    EXPECT_NE(maskMarkNet2.mark, static_cast<int>(fwmarkUdp & maskMarkNet2.mask));
+
+    // Remove test physical network.
+    EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID2).isOk());
+    EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID1).isOk());
 }
