@@ -25,6 +25,9 @@ cc_library {
         "libbase",
     ],
     export_include_dirs: ["include"],
+    sanitize: {
+        cfi: true,
+    },
 }
 
 cc_test {

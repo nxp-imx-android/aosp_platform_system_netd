@@ -31,6 +31,7 @@ aidl_interface {
         "binder/android/net/INetdUnsolicitedEventListener.aidl",
         "binder/android/net/InterfaceConfigurationParcel.aidl",
         "binder/android/net/MarkMaskParcel.aidl",
+        "binder/android/net/RouteInfoParcel.aidl",
         "binder/android/net/TetherConfigParcel.aidl",
         "binder/android/net/TetherStatsParcel.aidl",
         "binder/android/net/UidRangeParcel.aidl",
@@ -70,7 +71,6 @@ cc_library_static {
     srcs: [
         "BandwidthController.cpp",
         "ClatdController.cpp",
-        "ClatUtils.cpp",
         "Controllers.cpp",
         "NetdConstants.cpp",
         "FirewallController.cpp",
@@ -81,6 +81,7 @@ cc_library_static {
         "NetlinkCommands.cpp",
         "NetlinkListener.cpp",
         "NetlinkManager.cpp",
+        "OffloadUtils.cpp",
         "RouteController.cpp",
         "SockDiag.cpp",
         "StrictController.cpp",
@@ -118,6 +119,12 @@ cc_binary {
         "system/netd/include",
     ],
     init_rc: ["netd.rc"],
+    required: [
+        "bpfloader",
+        "clatd.o",
+        "netd.o",
+        "offload.o",
+    ],
     shared_libs: [
         "android.system.net.netd@1.0",
         "android.system.net.netd@1.1",
@@ -167,6 +174,9 @@ cc_binary {
         "main.cpp",
         "oem_iptables_hook.cpp",
     ],
+    sanitize: {
+        cfi: true,
+    },
 }
 
 cc_binary {
@@ -194,6 +204,9 @@ cc_binary {
         "UidRanges.cpp",
         "NdcDispatcher.cpp",
     ],
+    sanitize: {
+        cfi: true,
+    },
 }
 
 cc_test {
@@ -209,7 +222,6 @@ cc_test {
     srcs: [
         "BandwidthControllerTest.cpp",
         "ClatdControllerTest.cpp",
-        "ClatUtilsTest.cpp",
         "ControllersTest.cpp",
         "FirewallControllerTest.cpp",
         "IdletimerControllerTest.cpp",
@@ -217,6 +229,7 @@ cc_test {
         "IptablesBaseTest.cpp",
         "IptablesRestoreControllerTest.cpp",
         "NFLogListenerTest.cpp",
+        "OffloadUtilsTest.cpp",
         "RouteControllerTest.cpp",
         "SockDiagTest.cpp",
         "StrictControllerTest.cpp",

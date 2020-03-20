@@ -28,6 +28,9 @@ cc_library {
         "system/netd/libnetdutils/include",
     ],
     defaults: ["netd_defaults"],
+    sanitize: {
+        cfi: true,
+    },
 }
 
 cc_test {

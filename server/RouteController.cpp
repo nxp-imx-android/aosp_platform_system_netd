@@ -33,14 +33,17 @@
 #include "Fwmark.h"
 #include "NetdConstants.h"
 #include "NetlinkCommands.h"
+#include "OffloadUtils.h"
 #include "UidRanges.h"
 
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
 #include "log/log.h"
 #include "netid_client.h"
 #include "netutils/ifc.h"
 
+using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::WriteStringToFile;
 using android::net::UidRangeParcel;
@@ -117,6 +120,14 @@ rtattr FRATTR_UID_RANGE = { U16_RTA_LENGTH(sizeof(fib_rule_uid_range)), FRA_UID_
 rtattr RTATTR_TABLE     = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_TABLE };
 rtattr RTATTR_OIF       = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_OIF };
 rtattr RTATTR_PRIO      = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTA_PRIORITY };
+
+// One or more nested attributes in the RTA_METRICS attribute.
+rtattr RTATTRX_MTU      = { U16_RTA_LENGTH(sizeof(uint32_t)),           RTAX_MTU};
+constexpr size_t RTATTRX_MTU_SIZE = RTA_SPACE(sizeof(uint32_t));
+
+// The RTA_METRICS attribute itself.
+constexpr size_t RTATTR_METRICS_SIZE = RTATTRX_MTU_SIZE;
+rtattr RTATTR_METRICS   = { U16_RTA_LENGTH(RTATTR_METRICS_SIZE),         RTA_METRICS };
 
 uint8_t PADDING_BUFFER[RTA_ALIGNTO] = {0, 0, 0, 0};
 
@@ -339,8 +350,8 @@ int padInterfaceName(const char* input, char* name, size_t* length, uint16_t* pa
 
 // Adds or deletes an IPv4 or IPv6 route.
 // Returns 0 on success or negative errno on failure.
-int modifyIpRoute(uint16_t action, uint32_t table, const char* interface, const char* destination,
-                  const char* nexthop) {
+int modifyIpRoute(uint16_t action, uint16_t flags, uint32_t table, const char* interface,
+                  const char* destination, const char* nexthop, uint32_t mtu) {
     // At least the destination must be non-null.
     if (!destination) {
         ALOGE("null destination");
@@ -410,21 +421,22 @@ int modifyIpRoute(uint16_t action, uint32_t table, const char* interface, const 
     rtattr rtaGateway = { U16_RTA_LENGTH(rawLength), RTA_GATEWAY };
 
     iovec iov[] = {
-        { nullptr,          0 },
-        { &route,        sizeof(route) },
-        { &RTATTR_TABLE, sizeof(RTATTR_TABLE) },
-        { &table,        sizeof(table) },
-        { &rtaDst,       sizeof(rtaDst) },
-        { rawAddress,    static_cast<size_t>(rawLength) },
-        { &RTATTR_OIF,   interface != OIF_NONE ? sizeof(RTATTR_OIF) : 0 },
-        { &ifindex,      interface != OIF_NONE ? sizeof(ifindex) : 0 },
-        { &rtaGateway,   nexthop ? sizeof(rtaGateway) : 0 },
-        { rawNexthop,    nexthop ? static_cast<size_t>(rawLength) : 0 },
-        { &RTATTR_PRIO,  isDefaultThrowRoute ? sizeof(RTATTR_PRIO) : 0 },
-        { &PRIO_THROW,   isDefaultThrowRoute ? sizeof(PRIO_THROW) : 0 },
+        { nullptr,         0 },
+        { &route,          sizeof(route) },
+        { &RTATTR_TABLE,   sizeof(RTATTR_TABLE) },
+        { &table,          sizeof(table) },
+        { &rtaDst,         sizeof(rtaDst) },
+        { rawAddress,      static_cast<size_t>(rawLength) },
+        { &RTATTR_OIF,     interface != OIF_NONE ? sizeof(RTATTR_OIF) : 0 },
+        { &ifindex,        interface != OIF_NONE ? sizeof(ifindex) : 0 },
+        { &rtaGateway,     nexthop ? sizeof(rtaGateway) : 0 },
+        { rawNexthop,      nexthop ? static_cast<size_t>(rawLength) : 0 },
+        { &RTATTR_METRICS, mtu != 0 ? sizeof(RTATTR_METRICS) : 0 },
+        { &RTATTRX_MTU,    mtu != 0 ? sizeof(RTATTRX_MTU) : 0 },
+        { &mtu,            mtu != 0 ? sizeof(mtu) : 0 },
+        { &RTATTR_PRIO,    isDefaultThrowRoute ? sizeof(RTATTR_PRIO) : 0 },
+        { &PRIO_THROW,     isDefaultThrowRoute ? sizeof(PRIO_THROW) : 0 },
     };
-
-    uint16_t flags = (action == RTM_NEWROUTE) ? NETLINK_ROUTE_CREATE_FLAGS : NETLINK_REQUEST_FLAGS;
 
     // Allow creating multiple link-local routes in the same table, so we can make IPv6
     // work on all interfaces in the local_network table.
@@ -679,7 +691,7 @@ int RouteController::configureDummyNetwork() {
     const char *interface = DummyNetwork::INTERFACE_NAME;
     uint32_t table = getRouteTableForInterface(interface);
     if (table == RT_TABLE_UNSPEC) {
-        // getRouteTableForInterface has already looged an error.
+        // getRouteTableForInterface has already logged an error.
         return -ESRCH;
     }
 
@@ -697,11 +709,13 @@ int RouteController::configureDummyNetwork() {
         return ret;
     }
 
-    if ((ret = modifyIpRoute(RTM_NEWROUTE, table, interface, "0.0.0.0/0", nullptr))) {
+    if ((ret = modifyIpRoute(RTM_NEWROUTE, NETLINK_ROUTE_CREATE_FLAGS, table, interface,
+                             "0.0.0.0/0", nullptr, 0 /* mtu */))) {
         return ret;
     }
 
-    if ((ret = modifyIpRoute(RTM_NEWROUTE, table, interface, "::/0", nullptr))) {
+    if ((ret = modifyIpRoute(RTM_NEWROUTE, NETLINK_ROUTE_CREATE_FLAGS, table, interface, "::/0",
+                             nullptr, 0 /* mtu */))) {
         return ret;
     }
 
@@ -859,8 +873,9 @@ int RouteController::modifyTetheredNetwork(uint16_t action, const char* inputInt
 
 // Adds or removes an IPv4 or IPv6 route to the specified table.
 // Returns 0 on success or negative errno on failure.
-int RouteController::modifyRoute(uint16_t action, const char* interface, const char* destination,
-                                 const char* nexthop, TableType tableType) {
+int RouteController::modifyRoute(uint16_t action, uint16_t flags, const char* interface,
+                                 const char* destination, const char* nexthop, TableType tableType,
+                                 int mtu) {
     uint32_t table;
     switch (tableType) {
         case RouteController::INTERFACE: {
@@ -884,13 +899,45 @@ int RouteController::modifyRoute(uint16_t action, const char* interface, const c
         }
     }
 
-    int ret = modifyIpRoute(action, table, interface, destination, nexthop);
+    int ret = modifyIpRoute(action, flags, table, interface, destination, nexthop, mtu);
     // Trying to add a route that already exists shouldn't cause an error.
     if (ret && !(action == RTM_NEWROUTE && ret == -EEXIST)) {
         return ret;
     }
 
     return 0;
+}
+
+void maybeModifyQdiscClsact(const char* interface, bool add) {
+    if (!bpf::isBpfSupported()) return;
+
+    // The clsact attaching of v4- tun interface is triggered by ClatdController::maybeStartBpf
+    // because the clat is started before the v4- interface is added to the network and the
+    // clat startup needs to add {in, e}gress filters.
+    // TODO: remove this workaround once v4- tun interface clsact attaching is moved out from
+    // ClatdController::maybeStartBpf.
+    if (StartsWith(interface, "v4-") && add) return;
+
+    // The interface may have already gone away in the delete case.
+    uint32_t ifindex = if_nametoindex(interface);
+    if (!ifindex) {
+        ALOGE("cannot find interface %s", interface);
+        return;
+    }
+
+    if (add) {
+        if (int ret = tcQdiscAddDevClsact(ifindex)) {
+            ALOGE("tcQdiscAddDevClsact(%d[%s]) failure: %s", ifindex, interface, strerror(-ret));
+            return;
+        }
+    } else {
+        if (int ret = tcQdiscDelDevClsact(ifindex)) {
+            ALOGE("tcQdiscDelDevClsact(%d[%s]) failure: %s", ifindex, interface, strerror(-ret));
+            return;
+        }
+    }
+
+    return;
 }
 
 [[nodiscard]] static int clearTetheringRules(const char* inputInterface) {
@@ -984,6 +1031,7 @@ int RouteController::addInterfaceToPhysicalNetwork(unsigned netId, const char* i
     if (int ret = modifyPhysicalNetwork(netId, interface, permission, ACTION_ADD)) {
         return ret;
     }
+    maybeModifyQdiscClsact(interface, ACTION_ADD);
     updateTableNamesFile();
     return 0;
 }
@@ -999,6 +1047,7 @@ int RouteController::removeInterfaceFromPhysicalNetwork(unsigned netId, const ch
     if (int ret = clearTetheringRules(interface)) {
         return ret;
     }
+    maybeModifyQdiscClsact(interface, ACTION_DEL);
     updateTableNamesFile();
     return 0;
 }
@@ -1066,13 +1115,21 @@ int RouteController::removeInterfaceFromDefaultNetwork(const char* interface,
 }
 
 int RouteController::addRoute(const char* interface, const char* destination, const char* nexthop,
-                              TableType tableType) {
-    return modifyRoute(RTM_NEWROUTE, interface, destination, nexthop, tableType);
+                              TableType tableType, int mtu) {
+    return modifyRoute(RTM_NEWROUTE, NETLINK_ROUTE_CREATE_FLAGS, interface, destination, nexthop,
+                       tableType, mtu);
 }
 
 int RouteController::removeRoute(const char* interface, const char* destination,
                                  const char* nexthop, TableType tableType) {
-    return modifyRoute(RTM_DELROUTE, interface, destination, nexthop, tableType);
+    return modifyRoute(RTM_DELROUTE, NETLINK_REQUEST_FLAGS, interface, destination, nexthop,
+                       tableType, 0);
+}
+
+int RouteController::updateRoute(const char* interface, const char* destination,
+                                 const char* nexthop, TableType tableType, int mtu) {
+    return modifyRoute(RTM_NEWROUTE, NETLINK_ROUTE_REPLACE_FLAGS, interface, destination, nexthop,
+                       tableType, mtu);
 }
 
 int RouteController::enableTethering(const char* inputInterface, const char* outputInterface) {

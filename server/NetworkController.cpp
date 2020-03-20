@@ -36,6 +36,7 @@
 #include "DummyNetwork.h"
 #include "Fwmark.h"
 #include "LocalNetwork.h"
+#include "OffloadUtils.h"
 #include "PhysicalNetwork.h"
 #include "RouteController.h"
 #include "VirtualNetwork.h"
@@ -141,6 +142,22 @@ NetworkController::NetworkController() :
         mProtectableUsers({AID_VPN}) {
     mNetworks[LOCAL_NET_ID] = new LocalNetwork(LOCAL_NET_ID);
     mNetworks[DUMMY_NET_ID] = new DummyNetwork(DUMMY_NET_ID);
+
+    // Clear all clsact stubs on all interfaces.
+    // TODO: perhaps only remove the clsact on the interface which is added by
+    // RouteController::addInterfaceToPhysicalNetwork. Currently, the netd only
+    // attach the clsact to the interface for the physical network.
+    if (bpf::isBpfSupported()) {
+        const auto& ifaces = InterfaceController::getIfaceNames();
+        if (isOk(ifaces)) {
+            for (const std::string& iface : ifaces.value()) {
+                if (int ifIndex = if_nametoindex(iface.c_str())) {
+                    // Ignore the error because the interface might not have a clsact.
+                    tcQdiscDelDevClsact(ifIndex);
+                }
+            }
+        }
+    }
 }
 
 unsigned NetworkController::getDefaultNetwork() const {
@@ -585,13 +602,18 @@ int NetworkController::removeUsersFromNetwork(unsigned netId, const UidRanges& u
 }
 
 int NetworkController::addRoute(unsigned netId, const char* interface, const char* destination,
-                                const char* nexthop, bool legacy, uid_t uid) {
-    return modifyRoute(netId, interface, destination, nexthop, true, legacy, uid);
+                                const char* nexthop, bool legacy, uid_t uid, int mtu) {
+    return modifyRoute(netId, interface, destination, nexthop, ROUTE_ADD, legacy, uid, mtu);
+}
+
+int NetworkController::updateRoute(unsigned netId, const char* interface, const char* destination,
+                                   const char* nexthop, bool legacy, uid_t uid, int mtu) {
+    return modifyRoute(netId, interface, destination, nexthop, ROUTE_UPDATE, legacy, uid, mtu);
 }
 
 int NetworkController::removeRoute(unsigned netId, const char* interface, const char* destination,
                                    const char* nexthop, bool legacy, uid_t uid) {
-    return modifyRoute(netId, interface, destination, nexthop, false, legacy, uid);
+    return modifyRoute(netId, interface, destination, nexthop, ROUTE_REMOVE, legacy, uid, 0);
 }
 
 void NetworkController::addInterfaceAddress(unsigned ifIndex, const char* address) {
@@ -768,7 +790,8 @@ int NetworkController::checkUserNetworkAccessLocked(uid_t uid, unsigned netId) c
 }
 
 int NetworkController::modifyRoute(unsigned netId, const char* interface, const char* destination,
-                                   const char* nexthop, bool add, bool legacy, uid_t uid) {
+                                   const char* nexthop, enum RouteOperation op, bool legacy,
+                                   uid_t uid, int mtu) {
     ScopedRLock lock(mRWLock);
 
     if (!isValidNetworkLocked(netId)) {
@@ -798,8 +821,15 @@ int NetworkController::modifyRoute(unsigned netId, const char* interface, const 
         tableType = RouteController::INTERFACE;
     }
 
-    return add ? RouteController::addRoute(interface, destination, nexthop, tableType) :
-                 RouteController::removeRoute(interface, destination, nexthop, tableType);
+    switch (op) {
+        case ROUTE_ADD:
+            return RouteController::addRoute(interface, destination, nexthop, tableType, mtu);
+        case ROUTE_UPDATE:
+            return RouteController::updateRoute(interface, destination, nexthop, tableType, mtu);
+        case ROUTE_REMOVE:
+            return RouteController::removeRoute(interface, destination, nexthop, tableType);
+    }
+    return -EINVAL;
 }
 
 int NetworkController::modifyFallthroughLocked(unsigned vpnNetId, bool add) {

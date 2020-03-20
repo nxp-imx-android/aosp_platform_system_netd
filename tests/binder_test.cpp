@@ -71,7 +71,6 @@
 
 #define IP6TABLES_PATH "/system/bin/ip6tables"
 #define IPTABLES_PATH "/system/bin/iptables"
-#define TUN_DEV "/dev/tun"
 #define RAW_TABLE "raw"
 #define MANGLE_TABLE "mangle"
 #define FILTER_TABLE "filter"
@@ -1629,26 +1628,52 @@ TEST_F(BinderTest, BandwidthManipulateSpecialApp) {
 namespace {
 
 std::string ipRouteString(const std::string& ifName, const std::string& dst,
-                          const std::string& nextHop) {
+                          const std::string& nextHop, const std::string& mtu) {
     std::string dstString = (dst == "0.0.0.0/0" || dst == "::/0") ? "default" : dst;
 
     if (!nextHop.empty()) {
         dstString += " via " + nextHop;
     }
 
-    return dstString + " dev " + ifName;
+    dstString += " dev " + ifName;
+
+    if (!mtu.empty()) {
+        dstString += " proto static";
+        // IPv6 routes report the metric, IPv4 routes report the scope.
+        // TODO: move away from specifying the entire string and use a regexp instead.
+        if (dst.find(':') != std::string::npos) {
+            dstString += " metric 1024";
+        } else {
+            if (nextHop.empty()) {
+                dstString += " scope link";
+            }
+        }
+        dstString += " mtu " + mtu;
+    }
+
+    return dstString;
+}
+
+void expectNetworkRouteExistsWithMtu(const char* ipVersion, const std::string& ifName,
+                                     const std::string& dst, const std::string& nextHop,
+                                     const std::string& mtu, const char* table) {
+    std::string routeString = ipRouteString(ifName, dst, nextHop, mtu);
+    EXPECT_TRUE(ipRouteExists(ipVersion, table, ipRouteString(ifName, dst, nextHop, mtu)))
+            << "Couldn't find route to " << dst << ": '" << routeString << "' in table " << table;
 }
 
 void expectNetworkRouteExists(const char* ipVersion, const std::string& ifName,
                               const std::string& dst, const std::string& nextHop,
                               const char* table) {
-    EXPECT_TRUE(ipRouteExists(ipVersion, table, ipRouteString(ifName, dst, nextHop)));
+    expectNetworkRouteExistsWithMtu(ipVersion, ifName, dst, nextHop, "", table);
 }
 
 void expectNetworkRouteDoesNotExist(const char* ipVersion, const std::string& ifName,
                                     const std::string& dst, const std::string& nextHop,
                                     const char* table) {
-    EXPECT_FALSE(ipRouteExists(ipVersion, table, ipRouteString(ifName, dst, nextHop)));
+    std::string routeString = ipRouteString(ifName, dst, nextHop, "");
+    EXPECT_FALSE(ipRouteExists(ipVersion, table, ipRouteString(ifName, dst, nextHop, "")))
+            << "Found unexpected route " << routeString << " in table " << table;
 }
 
 bool ipRuleExists(const char* ipVersion, const std::string& ipRule) {
@@ -1880,6 +1905,46 @@ TEST_F(BinderTest, NetworkAddRemoveRouteUserPermission) {
         }
     }
 
+    for (size_t i = 0; i < std::size(kTestData); i++) {
+        const auto& td = kTestData[i];
+        int mtu = (i % 2) ? 1480 : 1280;
+
+        android::net::RouteInfoParcel parcel;
+        parcel.ifName = sTun.name();
+        parcel.destination = td.testDest;
+        parcel.nextHop = td.testNextHop;
+        parcel.mtu = mtu;
+        binder::Status status = mNetd->networkAddRouteParcel(TEST_NETID1, parcel);
+        if (td.expectSuccess) {
+            EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+            expectNetworkRouteExistsWithMtu(td.ipVersion, sTun.name(), td.testDest, td.testNextHop,
+                                            std::to_string(parcel.mtu), sTun.name().c_str());
+        } else {
+            EXPECT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
+            EXPECT_NE(0, status.serviceSpecificErrorCode());
+        }
+
+        parcel.mtu = 1337;
+        status = mNetd->networkUpdateRouteParcel(TEST_NETID1, parcel);
+        if (td.expectSuccess) {
+            EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+            expectNetworkRouteExistsWithMtu(td.ipVersion, sTun.name(), td.testDest, td.testNextHop,
+                                            std::to_string(parcel.mtu), sTun.name().c_str());
+        } else {
+            EXPECT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
+            EXPECT_NE(0, status.serviceSpecificErrorCode());
+        }
+
+        status = mNetd->networkRemoveRouteParcel(TEST_NETID1, parcel);
+        if (td.expectSuccess) {
+            EXPECT_TRUE(status.isOk()) << status.exceptionMessage();
+            expectNetworkRouteDoesNotExist(td.ipVersion, sTun.name(), td.testDest, td.testNextHop,
+                                           sTun.name().c_str());
+        } else {
+            EXPECT_EQ(binder::Status::EX_SERVICE_SPECIFIC, status.exceptionCode());
+            EXPECT_NE(0, status.serviceSpecificErrorCode());
+        }
+    }
     // Remove test physical network
     EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID1).isOk());
 }
@@ -2844,16 +2909,15 @@ TEST_F(BinderTest, TcpBufferSet) {
 namespace {
 
 void checkUidsInPermissionMap(std::vector<int32_t>& uids, bool exist) {
-    android::bpf::BpfMap<uint32_t, uint8_t> uidPermissionMap(
-            android::bpf::mapRetrieve(UID_PERMISSION_MAP_PATH, 0));
+    android::bpf::BpfMap<uint32_t, uint8_t> uidPermissionMap(UID_PERMISSION_MAP_PATH);
     for (int32_t uid : uids) {
-        android::netdutils::StatusOr<uint8_t> permission = uidPermissionMap.readValue(uid);
+        android::base::Result<uint8_t> permission = uidPermissionMap.readValue(uid);
         if (exist) {
-            EXPECT_TRUE(isOk(permission));
+            ASSERT_RESULT_OK(permission);
             EXPECT_EQ(INetd::PERMISSION_NONE, permission.value());
         } else {
-            EXPECT_FALSE(isOk(permission));
-            EXPECT_EQ(ENOENT, permission.status().code());
+            ASSERT_FALSE(permission.ok());
+            EXPECT_EQ(ENOENT, permission.error().code());
         }
     }
 }
@@ -3306,4 +3370,52 @@ TEST_F(BinderTest, GetFwmarkForNetwork) {
     // Remove test physical network.
     EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID2).isOk());
     EXPECT_TRUE(mNetd->networkDestroy(TEST_NETID1).isOk());
+}
+
+TEST_F(BinderTest, TetherRuleDownstreamIpv6) {
+    SKIP_IF_BPF_NOT_SUPPORTED;
+
+    // TODO: Perhaps verify invalid interface index once the netd handle the error in methods.
+    constexpr uint32_t kIfaceInt = 101;
+    constexpr uint32_t kIfaceExt = 102;
+    constexpr uint32_t kIfaceNonExistent = 103;
+
+    const std::vector<uint8_t> kAddr6 = {0x20, 0x01, 0x0d, 0xb8, 0xca, 0xfe, 0x00, 0x00,
+                                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88};
+    const std::vector<uint8_t> kSrcMac = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0a};
+    const std::vector<uint8_t> kDstMac = {0x00, 0x00, 0x00, 0x00, 0x00, 0x0b};
+
+    const std::vector<uint8_t> kInvalidAddr4 = {0xac, 0x0a, 0x0d, 0xb8};  // should be IPv6 address
+    const std::vector<uint8_t> kInvalidMac = {0xde, 0xad, 0xbe, 0xef};    // should be 6-byte length
+
+    // Invalid IP address, add rule
+    auto status = mNetd->tetherRuleAddDownstreamIpv6(kIfaceInt, kIfaceExt, kInvalidAddr4 /*bad*/,
+                                                     kSrcMac, kDstMac);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EINVAL, status.serviceSpecificErrorCode());
+
+    // Invalid source L2 address, add rule
+    status = mNetd->tetherRuleAddDownstreamIpv6(kIfaceInt, kIfaceExt, kAddr6, kInvalidMac /*bad*/,
+                                                kDstMac);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EINVAL, status.serviceSpecificErrorCode());
+
+    // Invalid destination L2 address, add rule
+    status = mNetd->tetherRuleAddDownstreamIpv6(kIfaceInt, kIfaceExt, kAddr6, kSrcMac,
+                                                kInvalidMac /*bad*/);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EINVAL, status.serviceSpecificErrorCode());
+
+    // Invalid IP address, remove rule
+    status = mNetd->tetherRuleRemoveDownstreamIpv6(kIfaceExt, kInvalidAddr4 /*bad*/);
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(EINVAL, status.serviceSpecificErrorCode());
+
+    // Remove non existent rule. Expect that silently return success if the rule did not exist.
+    EXPECT_TRUE(mNetd->tetherRuleRemoveDownstreamIpv6(kIfaceNonExistent, kAddr6).isOk());
+
+    // Add and remove rule normally.
+    EXPECT_TRUE(mNetd->tetherRuleAddDownstreamIpv6(kIfaceInt, kIfaceExt, kAddr6, kSrcMac, kDstMac)
+                        .isOk());
+    EXPECT_TRUE(mNetd->tetherRuleRemoveDownstreamIpv6(kIfaceExt, kAddr6).isOk());
 }

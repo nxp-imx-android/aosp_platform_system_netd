@@ -14,30 +14,29 @@
  * limitations under the License.
  */
 
-#include "ClatUtils.h"
+#include "OffloadUtils.h"
 
 #include <arpa/inet.h>
-#include <errno.h>
 #include <linux/if.h>
+#include <linux/if_arp.h>
 #include <linux/netlink.h>
 #include <linux/pkt_cls.h>
 #include <linux/pkt_sched.h>
-#include <linux/rtnetlink.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#define LOG_TAG "ClatUtils"
+#define LOG_TAG "OffloadUtils"
 #include <log/log.h>
 
 #include "NetlinkCommands.h"
 #include "android-base/unique_fd.h"
-#include "bpf/BpfUtils.h"
-#include "netdbpf/bpf_shared.h"
 
 namespace android {
 namespace net {
+
+using std::max;
 
 int hardwareAddressType(const std::string& interface) {
     base::unique_fd ufd(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
@@ -62,30 +61,28 @@ int hardwareAddressType(const std::string& interface) {
     return ifr.ifr_hwaddr.sa_family;
 }
 
-int getClatEgressMapFd(void) {
-    const int fd = bpf::bpfFdGet(CLAT_EGRESS_MAP_PATH, 0);
-    return (fd == -1) ? -errno : fd;
-}
+base::Result<bool> isEthernet(const std::string& interface) {
+    int rv = hardwareAddressType(interface);
+    if (rv < 0) {
+        errno = -rv;
+        return ErrnoErrorf("Get hardware address type of interface {} failed", interface);
+    }
 
-int getClatEgressProgFd(bool with_ethernet_header) {
-    const int fd = bpf::bpfFdGet(
-            with_ethernet_header ? CLAT_EGRESS_PROG_ETHER_PATH : CLAT_EGRESS_PROG_RAWIP_PATH, 0);
-    return (fd == -1) ? -errno : fd;
-}
-
-int getClatIngressMapFd(void) {
-    const int fd = bpf::bpfFdGet(CLAT_INGRESS_MAP_PATH, 0);
-    return (fd == -1) ? -errno : fd;
-}
-
-int getClatIngressProgFd(bool with_ethernet_header) {
-    const int fd = bpf::bpfFdGet(
-            with_ethernet_header ? CLAT_INGRESS_PROG_ETHER_PATH : CLAT_INGRESS_PROG_RAWIP_PATH, 0);
-    return (fd == -1) ? -errno : fd;
+    switch (rv) {
+        case ARPHRD_ETHER:
+            return true;
+        case ARPHRD_RAWIP:  // in Linux 4.14+ rmnet support was upstreamed and this is 519
+        case 530:           // this is ARPHRD_RAWIP on some Android 4.9 kernels with rmnet
+            return false;
+        default:
+            errno = EAFNOSUPPORT;  // Address family not supported
+            return ErrnoErrorf("Unknown hardware address type {} on interface {}", rv, interface);
+    }
 }
 
 // TODO: use //system/netd/server/NetlinkCommands.cpp:openNetlinkSocket(protocol)
-int openNetlinkSocket(void) {
+// and //system/netd/server/SockDiag.cpp:checkError(fd)
+static int sendAndProcessNetlinkResponse(const void* req, int len) {
     base::unique_fd fd(socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE));
     if (fd == -1) {
         const int err = errno;
@@ -93,10 +90,8 @@ int openNetlinkSocket(void) {
         return -err;
     }
 
-    int rv;
-
-    const int on = 1;
-    rv = setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &on, sizeof(on));
+    static constexpr int on = 1;
+    int rv = setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &on, sizeof(on));
     if (rv) ALOGE("setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, %d)", on);
 
     // this is needed to get sane strace netlink parsing, it allocates the pid
@@ -115,18 +110,17 @@ int openNetlinkSocket(void) {
         return -err;
     }
 
-    return fd.release();
-}
+    rv = send(fd, req, len, 0);
+    if (rv == -1) return -errno;
+    if (rv != len) return -EMSGSIZE;
 
-// TODO: merge with //system/netd/server/SockDiag.cpp:checkError(fd)
-int processNetlinkResponse(int fd) {
     struct {
         nlmsghdr h;
         nlmsgerr e;
         char buf[256];
     } resp = {};
 
-    const int rv = recv(fd, &resp, sizeof(resp), MSG_TRUNC);
+    rv = recv(fd, &resp, sizeof(resp), MSG_TRUNC);
 
     if (rv == -1) {
         const int err = errno;
@@ -155,14 +149,13 @@ int processNetlinkResponse(int fd) {
 // ADD:     nlMsgType=RTM_NEWQDISC nlMsgFlags=NLM_F_EXCL|NLM_F_CREATE
 // REPLACE: nlMsgType=RTM_NEWQDISC nlMsgFlags=NLM_F_CREATE|NLM_F_REPLACE
 // DEL:     nlMsgType=RTM_DELQDISC nlMsgFlags=0
-static int doTcQdiscClsact(int fd, int ifIndex, __u16 nlMsgType, __u16 nlMsgFlags) {
+int doTcQdiscClsact(int ifIndex, uint16_t nlMsgType, uint16_t nlMsgFlags) {
     // This is the name of the qdisc we are attaching.
     // Some hoop jumping to make this compile time constant with known size,
     // so that the structure declaration is well defined at compile time.
 #define CLSACT "clsact"
-    static const char clsact[] = CLSACT;
     // sizeof() includes the terminating NULL
-#define ASCIIZ_LEN_CLSACT sizeof(clsact)
+    static constexpr size_t ASCIIZ_LEN_CLSACT = sizeof(CLSACT);
 
     const struct {
         nlmsghdr n;
@@ -195,36 +188,15 @@ static int doTcQdiscClsact(int fd, int ifIndex, __u16 nlMsgType, __u16 nlMsgFlag
                             .str = CLSACT,
                     },
     };
-#undef ASCIIZ_LEN_CLSACT
 #undef CLSACT
 
-    const int rv = send(fd, &req, sizeof(req), 0);
-    if (rv == -1) return -errno;
-    if (rv != sizeof(req)) return -EMSGSIZE;
-
-    return processNetlinkResponse(fd);
-}
-
-int tcQdiscAddDevClsact(int fd, int ifIndex) {
-    return doTcQdiscClsact(fd, ifIndex, RTM_NEWQDISC, NLM_F_EXCL | NLM_F_CREATE);
-}
-
-int tcQdiscReplaceDevClsact(int fd, int ifIndex) {
-    return doTcQdiscClsact(fd, ifIndex, RTM_NEWQDISC, NLM_F_CREATE | NLM_F_REPLACE);
-}
-
-int tcQdiscDelDevClsact(int fd, int ifIndex) {
-    return doTcQdiscClsact(fd, ifIndex, RTM_DELQDISC, 0);
+    return sendAndProcessNetlinkResponse(&req, sizeof(req));
 }
 
 // tc filter add dev .. in/egress prio 1 protocol ipv6/ip bpf object-pinned /sys/fs/bpf/...
 // direct-action
-static int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet, bool ingress,
-                             bool ipv6) {
-    // The priority doesn't matter until we actually start attaching multiple
-    // things to the same interface's in/egress point.
-    const __u32 prio = 1;
-
+int tcFilterAddDevBpf(int ifIndex, bool ingress, uint16_t prio, uint16_t proto, int bpfFd,
+                      bool ethernet) {
     // This is the name of the filter we're attaching (ie. this is the 'bpf'
     // packet classifier enabled by kernel config option CONFIG_NET_CLS_BPF.
     //
@@ -232,9 +204,8 @@ static int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet, bool
     // so that we can define the struct further down the function with the
     // field for this sized correctly already during the build.
 #define BPF "bpf"
-    const char bpf[] = BPF;
     // sizeof() includes the terminating NULL
-#define ASCIIZ_LEN_BPF sizeof(bpf)
+    static constexpr size_t ASCIIZ_LEN_BPF = sizeof(BPF);
 
     // This is to replicate program name suffix used by 'tc' Linux cli
     // when it attaches programs.
@@ -244,48 +215,59 @@ static int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet, bool
     //   prog_clatd_schedcls_ingress_clat_rawip:[*fsobj]
     // and is the name of the pinned ingress ebpf program for ARPHRD_RAWIP interfaces.
     // (also compatible with anything that has 0 size L2 header)
-#define NAME_RX_RAWIP CLAT_INGRESS_PROG_RAWIP_NAME FSOBJ_SUFFIX
-    const char name_rx_rawip[] = NAME_RX_RAWIP;
+    static constexpr char name_clat_rx_rawip[] = CLAT_INGRESS_PROG_RAWIP_NAME FSOBJ_SUFFIX;
 
     // This macro expands (from header files) to:
     //   prog_clatd_schedcls_ingress_clat_ether:[*fsobj]
     // and is the name of the pinned ingress ebpf program for ARPHRD_ETHER interfaces.
     // (also compatible with anything that has standard ethernet header)
-#define NAME_RX_ETHER CLAT_INGRESS_PROG_ETHER_NAME FSOBJ_SUFFIX
-    const char name_rx_ether[] = NAME_RX_ETHER;
+    static constexpr char name_clat_rx_ether[] = CLAT_INGRESS_PROG_ETHER_NAME FSOBJ_SUFFIX;
 
     // This macro expands (from header files) to:
     //   prog_clatd_schedcls_egress_clat_rawip:[*fsobj]
     // and is the name of the pinned egress ebpf program for ARPHRD_RAWIP interfaces.
     // (also compatible with anything that has 0 size L2 header)
-#define NAME_TX_RAWIP CLAT_EGRESS_PROG_RAWIP_NAME FSOBJ_SUFFIX
-    const char name_tx_rawip[] = NAME_TX_RAWIP;
+    static constexpr char name_clat_tx_rawip[] = CLAT_EGRESS_PROG_RAWIP_NAME FSOBJ_SUFFIX;
 
     // This macro expands (from header files) to:
     //   prog_clatd_schedcls_egress_clat_ether:[*fsobj]
     // and is the name of the pinned egress ebpf program for ARPHRD_ETHER interfaces.
     // (also compatible with anything that has standard ethernet header)
-#define NAME_TX_ETHER CLAT_EGRESS_PROG_ETHER_NAME FSOBJ_SUFFIX
-    const char name_tx_ether[] = NAME_TX_ETHER;
+    static constexpr char name_clat_tx_ether[] = CLAT_EGRESS_PROG_ETHER_NAME FSOBJ_SUFFIX;
+
+    // This macro expands (from header files) to:
+    //   prog_offload_schedcls_ingress_tether_rawip:[*fsobj]
+    // and is the name of the pinned ingress ebpf program for ARPHRD_RAWIP interfaces.
+    // (also compatible with anything that has 0 size L2 header)
+    static constexpr char name_tether_rawip[] = TETHER_INGRESS_PROG_RAWIP_NAME FSOBJ_SUFFIX;
+
+    // This macro expands (from header files) to:
+    //   prog_offload_schedcls_ingress_tether_ether:[*fsobj]
+    // and is the name of the pinned ingress ebpf program for ARPHRD_ETHER interfaces.
+    // (also compatible with anything that has standard ethernet header)
+    static constexpr char name_tether_ether[] = TETHER_INGRESS_PROG_ETHER_NAME FSOBJ_SUFFIX;
+
+#undef FSOBJ_SUFFIX
 
     // The actual name we'll use is determined at run time via 'ethernet' and 'ingress'
     // booleans.  We need to compile time allocate enough space in the struct
     // hence this macro magic to make sure we have enough space for either
     // possibility.  In practice some of these are actually the same size.
-#define ASCIIZ_MAXLEN_NAME_RX                                                \
-    ((sizeof(name_rx_rawip) > sizeof(name_rx_ether)) ? sizeof(name_rx_rawip) \
-                                                     : sizeof(name_rx_ether))
-#define ASCIIZ_MAXLEN_NAME_TX                                                \
-    ((sizeof(name_tx_rawip) > sizeof(name_tx_ether)) ? sizeof(name_tx_rawip) \
-                                                     : sizeof(name_tx_ether))
-#define ASCIIZ_MAXLEN_NAME                                                   \
-    ((ASCIIZ_MAXLEN_NAME_RX > ASCIIZ_MAXLEN_NAME_TX) ? ASCIIZ_MAXLEN_NAME_RX \
-                                                     : ASCIIZ_MAXLEN_NAME_TX)
+    static constexpr size_t ASCIIZ_MAXLEN_NAME = max({
+            sizeof(name_clat_rx_rawip),
+            sizeof(name_clat_rx_ether),
+            sizeof(name_clat_tx_rawip),
+            sizeof(name_clat_tx_ether),
+            sizeof(name_tether_rawip),
+            sizeof(name_tether_ether),
+    });
 
-    // These are not compile time constants: NAME is used in strncpy below
-#define NAME_RX (ethernet ? NAME_RX_ETHER : NAME_RX_RAWIP)
-#define NAME_TX (ethernet ? NAME_TX_ETHER : NAME_TX_RAWIP)
-#define NAME (ingress ? NAME_RX : NAME_TX)
+    // These are not compile time constants: 'name' is used in strncpy below
+    const char* const name_clat_rx = ethernet ? name_clat_rx_ether : name_clat_rx_rawip;
+    const char* const name_clat_tx = ethernet ? name_clat_tx_ether : name_clat_tx_rawip;
+    const char* const name_clat = ingress ? name_clat_rx : name_clat_tx;
+    const char* const name_tether = ethernet ? name_tether_ether : name_tether_rawip;
+    const char* const name = (prio == PRIO_TETHER) ? name_tether : name_clat;
 
     struct {
         nlmsghdr n;
@@ -323,8 +305,7 @@ static int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet, bool
                             .tcm_handle = TC_H_UNSPEC,
                             .tcm_parent = TC_H_MAKE(TC_H_CLSACT,
                                                     ingress ? TC_H_MIN_INGRESS : TC_H_MIN_EGRESS),
-                            .tcm_info = (prio << 16) |
-                                        (__u32)(ipv6 ? htons(ETH_P_IPV6) : htons(ETH_P_IP)),
+                            .tcm_info = static_cast<__u32>((prio << 16) | htons(proto)),
                     },
             .kind =
                     {
@@ -373,38 +354,37 @@ static int tcFilterAddDevBpf(int fd, int ifIndex, int bpfFd, bool ethernet, bool
                                     },
                     },
     };
-
-    strncpy(req.options.name.str, NAME, sizeof(req.options.name.str));
-
-#undef NAME
-#undef NAME_TX
-#undef NAME_RX
-#undef ASCIIZ_MAXLEN_NAME
-#undef ASCIIZ_MAXLEN_NAME_TX
-#undef ASCIIZ_MAXLEN_NAME_RX
-#undef NAME_TX_ETHER
-#undef NAME_TX_RAWIP
-#undef NAME_RX_ETHER
-#undef NAME_RX_RAWIP
-#undef FSOBJ_SUFFIX
-#undef ASCIIZ_LEN_BPF
 #undef BPF
 
-    const int rv = send(fd, &req, sizeof(req), 0);
-    if (rv == -1) return -errno;
-    if (rv != sizeof(req)) return -EMSGSIZE;
+    strncpy(req.options.name.str, name, sizeof(req.options.name.str));
 
-    return processNetlinkResponse(fd);
+    return sendAndProcessNetlinkResponse(&req, sizeof(req));
 }
 
-// tc filter add dev .. ingress prio 1 protocol ipv6 bpf object-pinned /sys/fs/bpf/... direct-action
-int tcFilterAddDevIngressBpf(int fd, int ifIndex, int bpfFd, bool ethernet) {
-    return tcFilterAddDevBpf(fd, ifIndex, bpfFd, ethernet, /*ingress*/ true, /*ipv6*/ true);
-}
+// tc filter del dev .. in/egress prio .. protocol ..
+int tcFilterDelDev(int ifIndex, bool ingress, uint16_t prio, uint16_t proto) {
+    const struct {
+        nlmsghdr n;
+        tcmsg t;
+    } req = {
+            .n =
+                    {
+                            .nlmsg_len = sizeof(req),
+                            .nlmsg_type = RTM_DELTFILTER,
+                            .nlmsg_flags = NETLINK_REQUEST_FLAGS,
+                    },
+            .t =
+                    {
+                            .tcm_family = AF_UNSPEC,
+                            .tcm_ifindex = ifIndex,
+                            .tcm_handle = TC_H_UNSPEC,
+                            .tcm_parent = TC_H_MAKE(TC_H_CLSACT,
+                                                    ingress ? TC_H_MIN_INGRESS : TC_H_MIN_EGRESS),
+                            .tcm_info = static_cast<__u32>((prio << 16) | htons(proto)),
+                    },
+    };
 
-// tc filter add dev .. egress prio 1 protocol ip bpf object-pinned /sys/fs/bpf/... direct-action
-int tcFilterAddDevEgressBpf(int fd, int ifIndex, int bpfFd, bool ethernet) {
-    return tcFilterAddDevBpf(fd, ifIndex, bpfFd, ethernet, /*ingress*/ false, /*ipv6*/ false);
+    return sendAndProcessNetlinkResponse(&req, sizeof(req));
 }
 
 }  // namespace net
