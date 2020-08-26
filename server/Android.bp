@@ -25,6 +25,8 @@ aidl_interface {
                 "com.android.bluetooth.updatable",
                 "com.android.tethering",
             ],
+            // this is part of updatable modules(NetworkStack) which targets 29(Q)
+            min_sdk_version: "29",
         },
     },
     versions: [
@@ -146,6 +148,7 @@ cc_library_static {
         "libpcap",
         "libqtaguid",
         "libssl",
+        "libsysutils",
         "netd_aidl_interface-unstable-cpp",
         "netd_event_listener_interface-cpp",
     ],

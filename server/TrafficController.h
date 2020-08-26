@@ -97,7 +97,7 @@ class TrafficController {
 
     int removeUidOwnerRule(const uid_t uid);
 
-    int replaceUidOwnerMap(const std::string& name, bool isWhitelist,
+    int replaceUidOwnerMap(const std::string& name, bool isAllowlist,
                            const std::vector<int32_t>& uids);
 
     netdutils::Status updateOwnerMapEntry(UidOwnerMatchType match, uid_t uid, FirewallRule rule,
@@ -203,11 +203,10 @@ class TrafficController {
 
     std::unique_ptr<NetlinkListenerInterface> mSkDestroyListener;
 
-    netdutils::Status removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
-                                 UidOwnerMatchType match) REQUIRES(mMutex);
+    netdutils::Status removeRule(uint32_t uid, UidOwnerMatchType match) REQUIRES(mMutex);
 
-    netdutils::Status addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
-                              UidOwnerMatchType match, uint32_t iif = 0) REQUIRES(mMutex);
+    netdutils::Status addRule(uint32_t uid, UidOwnerMatchType match, uint32_t iif = 0)
+            REQUIRES(mMutex);
 
     bool mBpfEnabled;
 

@@ -202,7 +202,7 @@ Status TrafficController::initMaps() {
 
 static Status attachProgramToCgroup(const char* programPath, const unique_fd& cgroupFd,
                                     bpf_attach_type type) {
-    unique_fd cgroupProg(bpfFdGet(programPath, 0));
+    unique_fd cgroupProg(retrieveProgram(programPath));
     if (cgroupProg == -1) {
         int ret = errno;
         ALOGE("Failed to get program from %s: %s", programPath, strerror(ret));
@@ -521,10 +521,10 @@ int TrafficController::addInterface(const char* name, uint32_t ifaceIndex) {
 Status TrafficController::updateOwnerMapEntry(UidOwnerMatchType match, uid_t uid, FirewallRule rule,
                                               FirewallType type) {
     std::lock_guard guard(mMutex);
-    if ((rule == ALLOW && type == WHITELIST) || (rule == DENY && type == BLACKLIST)) {
-        RETURN_IF_NOT_OK(addRule(mUidOwnerMap, uid, match));
-    } else if ((rule == ALLOW && type == BLACKLIST) || (rule == DENY && type == WHITELIST)) {
-        RETURN_IF_NOT_OK(removeRule(mUidOwnerMap, uid, match));
+    if ((rule == ALLOW && type == ALLOWLIST) || (rule == DENY && type == DENYLIST)) {
+        RETURN_IF_NOT_OK(addRule(uid, match));
+    } else if ((rule == ALLOW && type == DENYLIST) || (rule == DENY && type == ALLOWLIST)) {
+        RETURN_IF_NOT_OK(removeRule(uid, match));
     } else {
         //Cannot happen.
         return statusFromErrno(EINVAL, "");
@@ -543,18 +543,17 @@ UidOwnerMatchType TrafficController::jumpOpToMatch(BandwidthController::IptJumpO
     }
 }
 
-Status TrafficController::removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
-                                     UidOwnerMatchType match) {
-    auto oldMatch = map.readValue(uid);
+Status TrafficController::removeRule(uint32_t uid, UidOwnerMatchType match) {
+    auto oldMatch = mUidOwnerMap.readValue(uid);
     if (oldMatch.ok()) {
         UidOwnerValue newMatch = {
                 .iif = (match == IIF_MATCH) ? 0 : oldMatch.value().iif,
                 .rule = static_cast<uint8_t>(oldMatch.value().rule & ~match),
         };
         if (newMatch.rule == 0) {
-            RETURN_IF_NOT_OK(map.deleteValue(uid));
+            RETURN_IF_NOT_OK(mUidOwnerMap.deleteValue(uid));
         } else {
-            RETURN_IF_NOT_OK(map.writeValue(uid, newMatch, BPF_ANY));
+            RETURN_IF_NOT_OK(mUidOwnerMap.writeValue(uid, newMatch, BPF_ANY));
         }
     } else {
         return statusFromErrno(ENOENT, StringPrintf("uid: %u does not exist in map", uid));
@@ -562,27 +561,26 @@ Status TrafficController::removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint3
     return netdutils::status::ok;
 }
 
-Status TrafficController::addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
-                                  UidOwnerMatchType match, uint32_t iif) {
+Status TrafficController::addRule(uint32_t uid, UidOwnerMatchType match, uint32_t iif) {
     // iif should be non-zero if and only if match == MATCH_IIF
     if (match == IIF_MATCH && iif == 0) {
         return statusFromErrno(EINVAL, "Interface match must have nonzero interface index");
     } else if (match != IIF_MATCH && iif != 0) {
         return statusFromErrno(EINVAL, "Non-interface match must have zero interface index");
     }
-    auto oldMatch = map.readValue(uid);
+    auto oldMatch = mUidOwnerMap.readValue(uid);
     if (oldMatch.ok()) {
         UidOwnerValue newMatch = {
                 .iif = iif ? iif : oldMatch.value().iif,
                 .rule = static_cast<uint8_t>(oldMatch.value().rule | match),
         };
-        RETURN_IF_NOT_OK(map.writeValue(uid, newMatch, BPF_ANY));
+        RETURN_IF_NOT_OK(mUidOwnerMap.writeValue(uid, newMatch, BPF_ANY));
     } else {
         UidOwnerValue newMatch = {
                 .iif = iif,
                 .rule = static_cast<uint8_t>(match),
         };
-        RETURN_IF_NOT_OK(map.writeValue(uid, newMatch, BPF_ANY));
+        RETURN_IF_NOT_OK(mUidOwnerMap.writeValue(uid, newMatch, BPF_ANY));
     }
     return netdutils::status::ok;
 }
@@ -605,9 +603,9 @@ Status TrafficController::updateUidOwnerMap(const std::vector<std::string>& appS
         }
 
         if (op == BandwidthController::IptOpDelete) {
-            RETURN_IF_NOT_OK(removeRule(mUidOwnerMap, uid, match));
+            RETURN_IF_NOT_OK(removeRule(uid, match));
         } else if (op == BandwidthController::IptOpInsert) {
-            RETURN_IF_NOT_OK(addRule(mUidOwnerMap, uid, match));
+            RETURN_IF_NOT_OK(addRule(uid, match));
         } else {
             // Cannot happen.
             return statusFromErrno(EINVAL, StringPrintf("invalid IptOp: %d, %d", op, match));
@@ -660,11 +658,11 @@ Status TrafficController::replaceRulesInMap(const UidOwnerMatchType match,
     RETURN_IF_NOT_OK(mUidOwnerMap.iterate(getUidsToDelete));
 
     for(auto uid : uidsToDelete) {
-        RETURN_IF_NOT_OK(removeRule(mUidOwnerMap, uid, match));
+        RETURN_IF_NOT_OK(removeRule(uid, match));
     }
 
     for (auto uid : uids) {
-        RETURN_IF_NOT_OK(addRule(mUidOwnerMap, uid, match));
+        RETURN_IF_NOT_OK(addRule(uid, match));
     }
     return netdutils::status::ok;
 }
@@ -681,7 +679,7 @@ Status TrafficController::addUidInterfaceRules(const int iif,
     std::lock_guard guard(mMutex);
 
     for (auto uid : uidsToAdd) {
-        netdutils::Status result = addRule(mUidOwnerMap, uid, IIF_MATCH, iif);
+        netdutils::Status result = addRule(uid, IIF_MATCH, iif);
         if (!isOk(result)) {
             ALOGW("addRule failed(%d): uid=%d iif=%d", result.code(), uid, iif);
         }
@@ -697,7 +695,7 @@ Status TrafficController::removeUidInterfaceRules(const std::vector<int32_t>& ui
     std::lock_guard guard(mMutex);
 
     for (auto uid : uidsToDelete) {
-        netdutils::Status result = removeRule(mUidOwnerMap, uid, IIF_MATCH);
+        netdutils::Status result = removeRule(uid, IIF_MATCH);
         if (!isOk(result)) {
             ALOGW("removeRule failed(%d): uid=%d", result.code(), uid);
         }
@@ -705,10 +703,10 @@ Status TrafficController::removeUidInterfaceRules(const std::vector<int32_t>& ui
     return netdutils::status::ok;
 }
 
-int TrafficController::replaceUidOwnerMap(const std::string& name, bool isWhitelist __unused,
+int TrafficController::replaceUidOwnerMap(const std::string& name, bool isAllowlist __unused,
                                           const std::vector<int32_t>& uids) {
-    // FirewallRule rule = isWhitelist ? ALLOW : DENY;
-    // FirewallType type = isWhitelist ? WHITELIST : BLACKLIST;
+    // FirewallRule rule = isAllowlist ? ALLOW : DENY;
+    // FirewallType type = isAllowlist ? ALLOWLIST : DENYLIST;
     Status res;
     if (!name.compare(FirewallController::LOCAL_DOZABLE)) {
         res = replaceRulesInMap(DOZABLE_MATCH, uids);
@@ -928,10 +926,10 @@ void TrafficController::dump(DumpWriter& dw, bool verbose) {
                getProgramStatus(XT_BPF_INGRESS_PROG_PATH).c_str());
     dw.println("xt_bpf egress program status: %s",
                getProgramStatus(XT_BPF_EGRESS_PROG_PATH).c_str());
-    dw.println("xt_bpf bandwidth whitelist program status: %s",
-               getProgramStatus(XT_BPF_WHITELIST_PROG_PATH).c_str());
-    dw.println("xt_bpf bandwidth blacklist program status: %s",
-               getProgramStatus(XT_BPF_BLACKLIST_PROG_PATH).c_str());
+    dw.println("xt_bpf bandwidth allowlist program status: %s",
+               getProgramStatus(XT_BPF_ALLOWLIST_PROG_PATH).c_str());
+    dw.println("xt_bpf bandwidth denylist program status: %s",
+               getProgramStatus(XT_BPF_DENYLIST_PROG_PATH).c_str());
 
     if (!verbose) {
         return;
