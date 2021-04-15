@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 The Android Open Source Project
+ * Copyright (C) 2021 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,14 +20,16 @@
 
 namespace android::net {
 
-class DummyNetwork : public Network {
+class UnreachableNetwork : public Network {
   public:
-    static const char* INTERFACE_NAME;
-    explicit DummyNetwork(unsigned netId);
-    virtual ~DummyNetwork();
+    explicit UnreachableNetwork(unsigned netId);
+    [[nodiscard]] int addUsers(const UidRanges& uidRanges) override;
+    [[nodiscard]] int removeUsers(const UidRanges& uidRanges) override;
+    bool isUnreachable() override { return true; }
+    bool canAddUsers() override { return true; }
 
   private:
-    std::string getTypeString() const override { return "DUMMY"; };
+    std::string getTypeString() const override { return "UNREACHABLE"; };
 };
 
 }  // namespace android::net

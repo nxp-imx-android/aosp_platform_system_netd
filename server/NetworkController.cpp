@@ -39,6 +39,7 @@
 #include "OffloadUtils.h"
 #include "PhysicalNetwork.h"
 #include "RouteController.h"
+#include "UnreachableNetwork.h"
 #include "VirtualNetwork.h"
 #include "netdutils/DumpWriter.h"
 #include "netid_client.h"
@@ -140,8 +141,10 @@ int NetworkController::DelegateImpl::modifyFallthrough(const std::string& physic
 NetworkController::NetworkController() :
         mDelegateImpl(new NetworkController::DelegateImpl(this)), mDefaultNetId(NETID_UNSET),
         mProtectableUsers({AID_VPN}) {
+    gLog.info("enter NetworkController ctor");
     mNetworks[LOCAL_NET_ID] = new LocalNetwork(LOCAL_NET_ID);
     mNetworks[DUMMY_NET_ID] = new DummyNetwork(DUMMY_NET_ID);
+    mNetworks[UNREACHABLE_NET_ID] = new UnreachableNetwork(UNREACHABLE_NET_ID);
 
     // Clear all clsact stubs on all interfaces.
     // TODO: perhaps only remove the clsact on the interface which is added by
@@ -156,6 +159,7 @@ NetworkController::NetworkController() :
             }
         }
     }
+    gLog.info("leave NetworkController ctor");
 }
 
 unsigned NetworkController::getDefaultNetwork() const {
@@ -205,7 +209,7 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
     fwmark.protectedFromVpn = true;
     fwmark.permission = PERMISSION_SYSTEM;
 
-    PhysicalNetwork* appDefaultNetwork = getPhysicalNetworkForUserLocked(uid);
+    Network* appDefaultNetwork = getPhysicalOrUnreachableNetworkForUserLocked(uid);
     unsigned defaultNetId = appDefaultNetwork ? appDefaultNetwork->getNetId() : mDefaultNetId;
 
     // Common case: there is no VPN that applies to the user, and the query did not specify a netId.
@@ -252,15 +256,15 @@ uint32_t NetworkController::getNetworkForDnsLocked(unsigned* netId, uid_t uid) c
 }
 
 // Returns the NetId that a given UID would use if no network is explicitly selected. Specifically,
-// the VPN that applies to the UID if any; otherwise, the default network for UID; lastly, the
-// default network.
+// the VPN that applies to the UID if any; Otherwise, the default network for UID; Otherwise the
+// unreachable network that applies to the UID; lastly, the default network.
 unsigned NetworkController::getNetworkForUser(uid_t uid) const {
     ScopedRLock lock(mRWLock);
     if (VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid)) {
         return virtualNetwork->getNetId();
     }
-    if (PhysicalNetwork* physicalNetwork = getPhysicalNetworkForUserLocked(uid)) {
-        return physicalNetwork->getNetId();
+    if (Network* network = getPhysicalOrUnreachableNetworkForUserLocked(uid)) {
+        return network->getNetId();
     }
     return mDefaultNetId;
 }
@@ -292,8 +296,8 @@ unsigned NetworkController::getNetworkForConnectLocked(uid_t uid) const {
     if (virtualNetwork && !virtualNetwork->isSecure()) {
         return virtualNetwork->getNetId();
     }
-    if (PhysicalNetwork* physicalNetwork = getPhysicalNetworkForUserLocked(uid)) {
-        return physicalNetwork->getNetId();
+    if (Network* network = getPhysicalOrUnreachableNetworkForUserLocked(uid)) {
+        return network->getNetId();
     }
     return mDefaultNetId;
 }
@@ -456,8 +460,8 @@ int NetworkController::createVirtualNetwork(unsigned netId, bool secure) {
 int NetworkController::destroyNetwork(unsigned netId) {
     ScopedWLock lock(mRWLock);
 
-    if (netId == LOCAL_NET_ID) {
-        ALOGE("cannot destroy local network");
+    if (netId == LOCAL_NET_ID || netId == UNREACHABLE_NET_ID) {
+        ALOGE("cannot destroy local or unreachable network");
         return -EINVAL;
     }
     if (!isValidNetworkLocked(netId)) {
@@ -597,8 +601,9 @@ int isWrongNetworkForUidRanges(unsigned netId, Network* network) {
         ALOGE("no such netId %u", netId);
         return -ENONET;
     }
-    if (!network->isVirtual() && !network->isPhysical()) {
-        ALOGE("cannot add/remove users to/from network %u, type %d", netId, network->getType());
+    if (!network->canAddUsers()) {
+        ALOGE("cannot add/remove users to/from %s network %u", network->getTypeString().c_str(),
+              netId);
         return -EINVAL;
     }
     return 0;
@@ -774,14 +779,20 @@ VirtualNetwork* NetworkController::getVirtualNetworkForUserLocked(uid_t uid) con
     return nullptr;
 }
 
-PhysicalNetwork* NetworkController::getPhysicalNetworkForUserLocked(uid_t uid) const {
+Network* NetworkController::getPhysicalOrUnreachableNetworkForUserLocked(uid_t uid) const {
+    // OEM-paid network take precedence over the unreachable network.
     for (const auto& [_, network] : mNetworks) {
         if (network->isPhysical() && network->appliesToUser(uid)) {
             // Return the first physical network that matches UID.
             // If there is more than one such network, the behaviour is undefined.
             // This is a configuration error.
-            return static_cast<PhysicalNetwork*>(network);
+            return network;
         }
+    }
+
+    auto iter = mNetworks.find(UNREACHABLE_NET_ID);
+    if (iter != mNetworks.end() && iter->second->appliesToUser(uid)) {
+        return iter->second;
     }
     return nullptr;
 }
@@ -825,6 +836,10 @@ int NetworkController::checkUserNetworkAccessLocked(uid_t uid, unsigned netId) c
     // UID has permission to use it regardless of whether the permission bits match.
     if (network->isPhysical() && network->appliesToUser(uid)) {
         return 0;
+    }
+    // Only apps that are configured as "no default network" can use the unreachable network.
+    if (network->isUnreachable()) {
+        return network->appliesToUser(uid) ? 0 : -EPERM;
     }
     // Check whether the UID's permission bits are sufficient to use the network.
     // Because the permission of the system default network is PERMISSION_NONE(0x0), apps can always

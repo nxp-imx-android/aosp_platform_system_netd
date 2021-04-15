@@ -112,6 +112,7 @@ using android::net::RULE_PRIORITY_PROHIBIT_NON_VPN;
 using android::net::RULE_PRIORITY_SECURE_VPN;
 using android::net::RULE_PRIORITY_TETHERING;
 using android::net::RULE_PRIORITY_UID_DEFAULT_NETWORK;
+using android::net::RULE_PRIORITY_UID_DEFAULT_UNREACHABLE;
 using android::net::RULE_PRIORITY_UID_EXPLICIT_NETWORK;
 using android::net::RULE_PRIORITY_UID_IMPLICIT_NETWORK;
 using android::net::RULE_PRIORITY_VPN_FALLTHROUGH;
@@ -269,6 +270,7 @@ void testNetworkExistsButCannotConnect(const sp<INetd>& netd, const int netId) {
 TEST_F(NetdBinderTest, InitialNetworksExist) {
     testNetworkExistsButCannotConnect(mNetd, INetd::DUMMY_NET_ID);
     testNetworkExistsButCannotConnect(mNetd, INetd::LOCAL_NET_ID);
+    testNetworkExistsButCannotConnect(mNetd, INetd::UNREACHABLE_NET_ID);
 }
 
 TEST_F(NetdBinderTest, IpSecTunnelInterface) {
@@ -1095,7 +1097,7 @@ bool iptablesIdleTimerInterfaceRuleExists(const char* binary, const char* chainN
 void expectIdletimerInterfaceRuleExists(const std::string& ifname, int timeout,
                                         const std::string& classLabel) {
     std::string IdletimerRule =
-            StringPrintf("timeout:%u label:%s send_nl_msg:1", timeout, classLabel.c_str());
+            StringPrintf("timeout:%u label:%s send_nl_msg", timeout, classLabel.c_str());
     for (const auto& binary : {IPTABLES_PATH, IP6TABLES_PATH}) {
         EXPECT_TRUE(iptablesIdleTimerInterfaceRuleExists(binary, IDLETIMER_RAW_PREROUTING, ifname,
                                                          IdletimerRule, RAW_TABLE));
@@ -1107,7 +1109,7 @@ void expectIdletimerInterfaceRuleExists(const std::string& ifname, int timeout,
 void expectIdletimerInterfaceRuleNotExists(const std::string& ifname, int timeout,
                                            const std::string& classLabel) {
     std::string IdletimerRule =
-            StringPrintf("timeout:%u label:%s send_nl_msg:1", timeout, classLabel.c_str());
+            StringPrintf("timeout:%u label:%s send_nl_msg", timeout, classLabel.c_str());
     for (const auto& binary : {IPTABLES_PATH, IP6TABLES_PATH}) {
         EXPECT_FALSE(iptablesIdleTimerInterfaceRuleExists(binary, IDLETIMER_RAW_PREROUTING, ifname,
                                                           IdletimerRule, RAW_TABLE));
@@ -3187,6 +3189,37 @@ bool sendIPv6PacketFromUid(uid_t uid, const in6_addr& dstAddr, Fwmark* fwmark, i
     return true;
 }
 
+// Send an IPv6 packet from the uid. Expect to fail and get specified errno.
+bool sendIPv6PacketFromUidFail(uid_t uid, const in6_addr& dstAddr, Fwmark* fwmark, bool doConnect,
+                               int expectedErr) {
+    ScopedUidChange scopedUidChange(uid);
+    unique_fd s(socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0));
+    if (s < 0) return false;
+
+    const sockaddr_in6 dst6 = {
+            .sin6_family = AF_INET6,
+            .sin6_port = 42,
+            .sin6_addr = dstAddr,
+    };
+    if (doConnect) {
+        if (connect(s, (sockaddr*)&dst6, sizeof(dst6)) == 0) return false;
+        if (errno != expectedErr) return false;
+    }
+
+    socklen_t fwmarkLen = sizeof(fwmark->intValue);
+    EXPECT_NE(-1, getsockopt(s, SOL_SOCKET, SO_MARK, &(fwmark->intValue), &fwmarkLen));
+
+    char addr[INET6_ADDRSTRLEN];
+    inet_ntop(AF_INET6, &dstAddr, addr, INET6_ADDRSTRLEN);
+    SCOPED_TRACE(StringPrintf("sendIPv6PacketFail, addr: %s, uid: %u, doConnect: %s", addr, uid,
+                              doConnect ? "true" : "false"));
+    if (!doConnect) {
+        if (sendto(s, "foo", sizeof("foo"), 0, (sockaddr*)&dst6, sizeof(dst6)) == 0) return false;
+        if (errno != expectedErr) return false;
+    }
+    return true;
+}
+
 void expectVpnFallthroughRuleExists(const std::string& ifName, int vpnNetId) {
     std::string vpnFallthroughRule =
             StringPrintf("%d:\tfrom all fwmark 0x%x/0xffff lookup %s",
@@ -3761,15 +3794,27 @@ namespace {
 void verifyAppUidRules(std::vector<bool>&& expectedResults, std::vector<UidRangeParcel>& uidRanges,
                        const std::string& iface) {
     ASSERT_EQ(expectedResults.size(), uidRanges.size());
-    std::string action = StringPrintf("lookup %s ", iface.c_str());
-
-    for (unsigned long i = 0; i < uidRanges.size(); i++) {
-        EXPECT_EQ(expectedResults[i],
-                  ipRuleExistsForRange(RULE_PRIORITY_UID_EXPLICIT_NETWORK, uidRanges[i], action));
-        EXPECT_EQ(expectedResults[i],
-                  ipRuleExistsForRange(RULE_PRIORITY_UID_IMPLICIT_NETWORK, uidRanges[i], action));
-        EXPECT_EQ(expectedResults[i],
-                  ipRuleExistsForRange(RULE_PRIORITY_UID_DEFAULT_NETWORK, uidRanges[i], action));
+    if (iface.size()) {
+        std::string action = StringPrintf("lookup %s ", iface.c_str());
+        for (unsigned long i = 0; i < uidRanges.size(); i++) {
+            EXPECT_EQ(expectedResults[i], ipRuleExistsForRange(RULE_PRIORITY_UID_EXPLICIT_NETWORK,
+                                                               uidRanges[i], action));
+            EXPECT_EQ(expectedResults[i], ipRuleExistsForRange(RULE_PRIORITY_UID_IMPLICIT_NETWORK,
+                                                               uidRanges[i], action));
+            EXPECT_EQ(expectedResults[i], ipRuleExistsForRange(RULE_PRIORITY_UID_DEFAULT_NETWORK,
+                                                               uidRanges[i], action));
+        }
+    } else {
+        std::string action = "unreachable";
+        for (unsigned long i = 0; i < uidRanges.size(); i++) {
+            EXPECT_EQ(expectedResults[i], ipRuleExistsForRange(RULE_PRIORITY_UID_EXPLICIT_NETWORK,
+                                                               uidRanges[i], action));
+            EXPECT_EQ(expectedResults[i], ipRuleExistsForRange(RULE_PRIORITY_UID_IMPLICIT_NETWORK,
+                                                               uidRanges[i], action));
+            EXPECT_EQ(expectedResults[i],
+                      ipRuleExistsForRange(RULE_PRIORITY_UID_DEFAULT_UNREACHABLE, uidRanges[i],
+                                           action));
+        }
     }
 }
 
@@ -3788,6 +3833,28 @@ void expectPacketSentOnNetId(uid_t uid, unsigned netId, int fd, int selectionMod
     Fwmark fwmark;
     const bool doConnect = (selectionMode != UNCONNECTED_SOCKET);
     EXPECT_TRUE(sendIPv6PacketFromUid(uid, V6_ADDR, &fwmark, fd, doConnect));
+
+    Fwmark expected;
+    expected.netId = netId;
+    expected.explicitlySelected = (selectionMode == EXPLICITLY_SELECT);
+    if (uid == AID_ROOT && selectionMode == EXPLICITLY_SELECT) {
+        expected.protectedFromVpn = true;
+    } else {
+        expected.protectedFromVpn = false;
+    }
+    if (selectionMode == UNCONNECTED_SOCKET) {
+        expected.permission = PERMISSION_NONE;
+    } else {
+        expected.permission = (uid == AID_ROOT) ? PERMISSION_SYSTEM : PERMISSION_NONE;
+    }
+
+    EXPECT_EQ(expected.intValue, fwmark.intValue);
+}
+
+void expectUnreachableError(uid_t uid, unsigned netId, int selectionMode) {
+    Fwmark fwmark;
+    const bool doConnect = (selectionMode != UNCONNECTED_SOCKET);
+    EXPECT_TRUE(sendIPv6PacketFromUidFail(uid, V6_ADDR, &fwmark, doConnect, ENETUNREACH));
 
     Fwmark expected;
     expected.netId = netId;
@@ -3865,6 +3932,13 @@ TEST_F(NetdBinderTest, PerAppDefaultNetwork_VerifyIpRules) {
     verifyAppUidRules({false, true} /*expectedResults*/, uidRanges, sTun.name());
     EXPECT_TRUE(mNetd->networkRemoveUidRanges(APP_DEFAULT_NETID, {uidRanges.at(1)}).isOk());
     verifyAppUidRules({false, false} /*expectedResults*/, uidRanges, sTun.name());
+
+    EXPECT_TRUE(mNetd->networkAddUidRanges(INetd::UNREACHABLE_NET_ID, uidRanges).isOk());
+    verifyAppUidRules({true, true} /*expectedResults*/, uidRanges, "");
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(INetd::UNREACHABLE_NET_ID, {uidRanges.at(0)}).isOk());
+    verifyAppUidRules({false, true} /*expectedResults*/, uidRanges, "");
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(INetd::UNREACHABLE_NET_ID, {uidRanges.at(1)}).isOk());
+    verifyAppUidRules({false, false} /*expectedResults*/, uidRanges, "");
 }
 
 // Verify whether packets go through the right network with and without per-app default network.
@@ -3896,6 +3970,18 @@ TEST_F(NetdBinderTest, PerAppDefaultNetwork_ImplicitlySelectNetwork) {
                         .isOk());
     expectPacketSentOnNetId(AID_ROOT, SYSTEM_DEFAULT_NETID, systemDefaultFd, IMPLICITLY_SELECT);
     expectPacketSentOnNetId(TEST_UID1, SYSTEM_DEFAULT_NETID, systemDefaultFd, IMPLICITLY_SELECT);
+
+    // Prohibit TEST_UID1 from using the default network.
+    EXPECT_TRUE(mNetd->networkAddUidRanges(INetd::UNREACHABLE_NET_ID,
+                                           {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
+    expectPacketSentOnNetId(AID_ROOT, SYSTEM_DEFAULT_NETID, systemDefaultFd, IMPLICITLY_SELECT);
+    expectUnreachableError(TEST_UID1, INetd::UNREACHABLE_NET_ID, IMPLICITLY_SELECT);
+
+    // restore IP rules
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(INetd::UNREACHABLE_NET_ID,
+                                              {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
 }
 
 // Verify whether packets go through the right network when app explicitly selects a network.
@@ -3910,6 +3996,19 @@ TEST_F(NetdBinderTest, PerAppDefaultNetwork_ExplicitlySelectNetwork) {
     // Connections go through the system default network.
     expectPacketSentOnNetId(AID_ROOT, SYSTEM_DEFAULT_NETID, systemDefaultFd, EXPLICITLY_SELECT);
     expectPacketSentOnNetId(TEST_UID1, SYSTEM_DEFAULT_NETID, systemDefaultFd, EXPLICITLY_SELECT);
+
+    // Set TEST_UID1 to default unreachable, which won't affect the explicitly selected network.
+    // Connections go through the system default network.
+    EXPECT_TRUE(mNetd->networkAddUidRanges(INetd::UNREACHABLE_NET_ID,
+                                           {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
+    expectPacketSentOnNetId(AID_ROOT, SYSTEM_DEFAULT_NETID, systemDefaultFd, EXPLICITLY_SELECT);
+    expectPacketSentOnNetId(TEST_UID1, SYSTEM_DEFAULT_NETID, systemDefaultFd, EXPLICITLY_SELECT);
+
+    // restore IP rules
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(INetd::UNREACHABLE_NET_ID,
+                                              {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
 
     // Add TEST_UID1 to per-app default network, which won't affect the explicitly selected network.
     EXPECT_TRUE(mNetd->networkAddUidRanges(APP_DEFAULT_NETID,
@@ -3944,6 +4043,29 @@ TEST_F(NetdBinderTest, PerAppDefaultNetwork_UnconnectedSocket) {
                         .isOk());
     expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
     expectPacketSentOnNetId(TEST_UID1, NETID_UNSET, appDefaultFd, UNCONNECTED_SOCKET);
+
+    // Set TEST_UID1's default network to unreachable. Its traffic should still go through the
+    // per-app default network. Other traffic go through the system default network.
+    // PS: per-app default network take precedence over unreachable network. This should happens
+    //     only in the transition period when both rules are briefly set.
+    EXPECT_TRUE(mNetd->networkAddUidRanges(INetd::UNREACHABLE_NET_ID,
+                                           {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
+    expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
+    expectPacketSentOnNetId(TEST_UID1, NETID_UNSET, appDefaultFd, UNCONNECTED_SOCKET);
+
+    // Remove TEST_UID1's default network from OEM-paid network. Its traffic should get ENETUNREACH
+    // error. Other traffic still go through the system default network.
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(APP_DEFAULT_NETID,
+                                              {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
+    expectPacketSentOnNetId(AID_ROOT, NETID_UNSET, systemDefaultFd, UNCONNECTED_SOCKET);
+    expectUnreachableError(TEST_UID1, NETID_UNSET, UNCONNECTED_SOCKET);
+
+    // restore IP rules
+    EXPECT_TRUE(mNetd->networkRemoveUidRanges(INetd::UNREACHABLE_NET_ID,
+                                              {makeUidRangeParcel(TEST_UID1, TEST_UID1)})
+                        .isOk());
 }
 
 TEST_F(NetdBinderTest, PerAppDefaultNetwork_PermissionCheck) {

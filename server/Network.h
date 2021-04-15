@@ -27,39 +27,35 @@ namespace android::net {
 // A Network represents a collection of interfaces participating as a single administrative unit.
 class Network {
 public:
-    enum Type {
-        DUMMY,
-        LOCAL,
-        PHYSICAL,
-        VIRTUAL,
-    };
-
     // You MUST ensure that no interfaces are still assigned to this network, say by calling
     // clearInterfaces(), before deleting it. This is because interface removal may fail. If we
     // automatically removed interfaces in the destructor, you wouldn't know if it failed.
     virtual ~Network();
 
-    virtual Type getType() const = 0;
+    virtual std::string getTypeString() const = 0;
     unsigned getNetId() const;
 
     bool hasInterface(const std::string& interface) const;
     const std::set<std::string>& getInterfaces() const;
 
     // These return 0 on success or negative errno on failure.
-    [[nodiscard]] virtual int addInterface(const std::string& interface) = 0;
-    [[nodiscard]] virtual int removeInterface(const std::string& interface) = 0;
+    [[nodiscard]] virtual int addInterface(const std::string&) { return -EINVAL; }
+    [[nodiscard]] virtual int removeInterface(const std::string&) { return -EINVAL; }
     [[nodiscard]] int clearInterfaces();
 
     std::string toString() const;
     bool appliesToUser(uid_t uid) const;
-    [[nodiscard]] int addUsers(const UidRanges& uidRanges);
-    [[nodiscard]] int removeUsers(const UidRanges& uidRanges);
+    [[nodiscard]] virtual int addUsers(const UidRanges&) { return -EINVAL; };
+    [[nodiscard]] virtual int removeUsers(const UidRanges&) { return -EINVAL; };
     bool isSecure() const;
-    bool isPhysical() { return getType() == PHYSICAL; }
-    bool isVirtual() { return getType() == VIRTUAL; }
+    virtual bool isPhysical() { return false; }
+    virtual bool isUnreachable() { return false; }
+    virtual bool isVirtual() { return false; }
+    virtual bool canAddUsers() { return false; }
 
 protected:
     explicit Network(unsigned netId, bool mSecure = false);
+    bool hasInvalidUidRanges(const UidRanges& uidRanges) const;
 
     const unsigned mNetId;
     std::set<std::string> mInterfaces;
@@ -71,8 +67,6 @@ private:
         REMOVE,
         ADD,
     };
-
-    bool hasInvalidUidRanges(const UidRanges& uidRanges) const;
 };
 
 }  // namespace android::net
