@@ -39,8 +39,9 @@ bpf {
         "-Werror",
     ],
     include_dirs: [
-        "system/netd/libnetdbpf/include",
-        "system/netd/libnetdutils/include",
+        "frameworks/libs/net/common/netd/libnetdutils/include",
+        // TODO: remove when this module is moved to Tethering module
+        "packages/modules/Connectivity/bpf_progs",
     ],
 }
 
@@ -52,7 +53,8 @@ bpf {
         "-Werror",
     ],
     include_dirs: [
-        "system/netd/libnetdbpf/include",
-        "system/netd/libnetdutils/include",
+        "frameworks/libs/net/common/netd/libnetdutils/include",
+        // TODO: remove when this module is moved to Tethering module
+        "packages/modules/Connectivity/bpf_progs",
     ],
 }

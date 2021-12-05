@@ -34,7 +34,7 @@
 
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
-#include <libbpf_android.h>
+#include <bpf/WaitForProgsLoaded.h>
 #include <netdutils/Stopwatch.h>
 
 #include "Controllers.h"
