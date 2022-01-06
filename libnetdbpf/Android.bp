@@ -27,12 +27,12 @@ cc_library {
     name: "libnetdbpf",
     vendor_available: false,
     host_supported: false,
+    header_libs: ["bpf_connectivity_headers"],
     srcs: [
         "BpfNetworkStats.cpp"
     ],
     shared_libs: [
         "libbase",
-        "libbpf_android",
         "liblog",
         "libnetdutils",
     ],
@@ -47,6 +47,7 @@ cc_test {
     name: "libnetdbpf_test",
     test_suites: ["device-tests"],
     require_root: true,
+    header_libs: ["bpf_connectivity_headers"],
     srcs: [
         "BpfNetworkStatsTest.cpp",
     ],
@@ -54,7 +55,6 @@ cc_test {
     static_libs: ["libgmock"],
     shared_libs: [
         "libbase",
-        "libbpf_android",
         "liblog",
         "libnetdbpf",
         "libnetdutils",

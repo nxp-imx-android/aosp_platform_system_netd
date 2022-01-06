@@ -55,11 +55,11 @@
 #include <binder/IPCThreadState.h>
 #include <bpf/BpfMap.h>
 #include <bpf/BpfUtils.h>
+#include <bpf_shared.h>
 #include <com/android/internal/net/BnOemNetdUnsolicitedEventListener.h>
 #include <com/android/internal/net/IOemNetd.h>
 #include <cutils/multiuser.h>
 #include <gtest/gtest.h>
-#include <netdbpf/bpf_shared.h>
 #include <netutils/ifc.h>
 #include <utils/Errors.h>
 #include "Fwmark.h"
@@ -76,6 +76,7 @@
 #include "netdutils/InternetAddresses.h"
 #include "netdutils/Stopwatch.h"
 #include "netdutils/Syscalls.h"
+#include "netdutils/Utils.h"
 #include "netid_client.h"  // NETID_UNSET
 #include "test_utils.h"
 #include "tun_interface.h"
@@ -128,6 +129,7 @@ using android::net::TunInterface;
 using android::net::UidRangeParcel;
 using android::net::UidRanges;
 using android::net::netd::aidl::NativeUidRangeConfig;
+using android::netdutils::getIfaceNames;
 using android::netdutils::IPAddress;
 using android::netdutils::ScopedAddrinfo;
 using android::netdutils::sSyscalls;
@@ -618,7 +620,7 @@ UidRangeParcel makeUidRangeParcel(int uid) {
 }
 
 NativeUidRangeConfig makeNativeUidRangeConfig(unsigned netId, std::vector<UidRangeParcel> uidRanges,
-                                              uint32_t subPriority) {
+                                              int32_t subPriority) {
     NativeUidRangeConfig res;
     res.netId = netId;
     res.uidRanges = move(uidRanges);
@@ -2693,7 +2695,7 @@ std::vector<std::string> getInterfaceFlags(const std::string& ifName) {
 }
 
 bool compareListInterface(const std::vector<std::string>& interfaceList) {
-    const auto& res = InterfaceController::getIfaceNames();
+    const auto& res = getIfaceNames();
     EXPECT_TRUE(isOk(res));
 
     std::vector<std::string> resIfList;
@@ -4045,7 +4047,7 @@ namespace {
 #define VPN_NETID TEST_NETID3
 
 void verifyAppUidRules(std::vector<bool>&& expectedResults, std::vector<UidRangeParcel>& uidRanges,
-                       const std::string& iface, uint32_t subPriority) {
+                       const std::string& iface, int32_t subPriority) {
     ASSERT_EQ(expectedResults.size(), uidRanges.size());
     if (iface.size()) {
         std::string action = StringPrintf("lookup %s ", iface.c_str());
@@ -4087,7 +4089,7 @@ void verifyVpnUidRules(std::vector<bool>&& expectedResults, NativeUidRangeConfig
     ASSERT_EQ(expectedResults.size(), uidRangeConfig.uidRanges.size());
     std::string action = StringPrintf("lookup %s ", iface.c_str());
 
-    uint32_t priority;
+    int32_t priority;
     if (secure) {
         priority = RULE_PRIORITY_SECURE_VPN;
     } else {
@@ -4565,10 +4567,10 @@ TEST_F(NetdBinderTest, NetworkCreate) {
 TEST_F(NetdBinderTest, UidRangeSubPriority_ValidateInputs) {
     createVpnAndOtherPhysicalNetwork(SYSTEM_DEFAULT_NETID, APP_DEFAULT_NETID, VPN_NETID,
                                      /*isSecureVPN=*/true);
-    // Invalid priority -1 on a physical network.
+    // Invalid priority -10 on a physical network.
     NativeUidRangeConfig uidRangeConfig =
             makeNativeUidRangeConfig(APP_DEFAULT_NETID, {makeUidRangeParcel(BASE_UID, BASE_UID)},
-                                     UidRanges::DEFAULT_SUB_PRIORITY - 1);
+                                     UidRanges::DEFAULT_SUB_PRIORITY - 10);
     binder::Status status = mNetd->networkAddUidRangesParcel(uidRangeConfig);
     EXPECT_FALSE(status.isOk());
     EXPECT_EQ(EINVAL, status.serviceSpecificErrorCode());

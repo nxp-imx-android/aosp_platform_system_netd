@@ -42,12 +42,11 @@
 
 #include <netdutils/Misc.h>
 #include <netdutils/Syscalls.h>
+#include <netdutils/Utils.h>
 #include <processgroup/processgroup.h>
 #include "TrafficController.h"
 #include "bpf/BpfMap.h"
 
-#include "FirewallController.h"
-#include "InterfaceController.h"
 #include "NetlinkListener.h"
 #include "netdutils/DumpWriter.h"
 #include "qtaguid/qtaguid.h"
@@ -64,6 +63,7 @@ using bpf::retrieveProgram;
 using bpf::synchronizeKernelRCU;
 using netdutils::DumpWriter;
 using netdutils::extract;
+using netdutils::getIfaceList;
 using netdutils::ScopedIndent;
 using netdutils::Slice;
 using netdutils::sSyscalls;
@@ -80,6 +80,11 @@ constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
 // Otherwise, apps would be able to avoid data usage accounting entirely by filling up the
 // map with tagged traffic entries.
 constexpr int TOTAL_UID_STATS_ENTRIES_LIMIT = STATS_MAP_SIZE * 0.9;
+
+const char* TrafficController::LOCAL_DOZABLE = "fw_dozable";
+const char* TrafficController::LOCAL_STANDBY = "fw_standby";
+const char* TrafficController::LOCAL_POWERSAVE = "fw_powersave";
+const char* TrafficController::LOCAL_RESTRICTED = "fw_restricted";
 
 static_assert(BPF_PERMISSION_INTERNET == INetd::PERMISSION_INTERNET,
               "Mismatch between BPF and AIDL permissions: PERMISSION_INTERNET");
@@ -263,7 +268,7 @@ Status TrafficController::start() {
     // Fetch the list of currently-existing interfaces. At this point NetlinkHandler is
     // already running, so it will call addInterface() when any new interface appears.
     std::map<std::string, uint32_t> ifacePairs;
-    ASSIGN_OR_RETURN(ifacePairs, InterfaceController::getIfaceList());
+    ASSIGN_OR_RETURN(ifacePairs, getIfaceList());
     for (const auto& ifacePair:ifacePairs) {
         addInterface(ifacePair.first.c_str(), ifacePair.second);
     }
@@ -574,6 +579,22 @@ Status TrafficController::updateUidOwnerMap(const std::vector<uint32_t>& appUids
     return netdutils::status::ok;
 }
 
+FirewallType TrafficController::getFirewallType(ChildChain chain) {
+    switch (chain) {
+        case DOZABLE:
+            return ALLOWLIST;
+        case STANDBY:
+            return DENYLIST;
+        case POWERSAVE:
+            return ALLOWLIST;
+        case RESTRICTED:
+            return ALLOWLIST;
+        case NONE:
+        default:
+            return DENYLIST;
+    }
+}
+
 int TrafficController::changeUidOwnerRule(ChildChain chain, uid_t uid, FirewallRule rule,
                                           FirewallType type) {
     Status res;
@@ -592,6 +613,7 @@ int TrafficController::changeUidOwnerRule(ChildChain chain, uid_t uid, FirewallR
             break;
         case NONE:
         default:
+            ALOGW("Unknown child chain: %d", chain);
             return -EINVAL;
     }
     if (!isOk(res)) {
@@ -659,13 +681,13 @@ int TrafficController::replaceUidOwnerMap(const std::string& name, bool isAllowl
     // FirewallRule rule = isAllowlist ? ALLOW : DENY;
     // FirewallType type = isAllowlist ? ALLOWLIST : DENYLIST;
     Status res;
-    if (!name.compare(FirewallController::LOCAL_DOZABLE)) {
+    if (!name.compare(LOCAL_DOZABLE)) {
         res = replaceRulesInMap(DOZABLE_MATCH, uids);
-    } else if (!name.compare(FirewallController::LOCAL_STANDBY)) {
+    } else if (!name.compare(LOCAL_STANDBY)) {
         res = replaceRulesInMap(STANDBY_MATCH, uids);
-    } else if (!name.compare(FirewallController::LOCAL_POWERSAVE)) {
+    } else if (!name.compare(LOCAL_POWERSAVE)) {
         res = replaceRulesInMap(POWERSAVE_MATCH, uids);
-    } else if (!name.compare(FirewallController::LOCAL_RESTRICTED)) {
+    } else if (!name.compare(LOCAL_RESTRICTED)) {
         res = replaceRulesInMap(RESTRICTED_MATCH, uids);
     } else {
         ALOGE("unknown chain name: %s", name.c_str());

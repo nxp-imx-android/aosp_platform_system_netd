@@ -45,6 +45,7 @@ cc_library_static {
         "system/netd/include",
         "system/netd/server/binder",
     ],
+    header_libs: ["bpf_connectivity_headers"],
     srcs: [
         "BandwidthController.cpp",
         "ClatdController.cpp",
@@ -70,7 +71,6 @@ cc_library_static {
         "XfrmController.cpp",
     ],
     shared_libs: [
-        "libbpf_android",
         "libbase",
         "libbinder",
         "libnetdbpf",
@@ -82,6 +82,9 @@ cc_library_static {
         "libsysutils",
         "netd_aidl_interface-V7-cpp",
         "netd_event_listener_interface-V1-cpp",
+    ],
+    static_libs: [
+        "libip_checksum",
     ],
     aidl: {
         export_aidl_headers: true,
@@ -102,12 +105,12 @@ cc_binary {
         "clatd.o",
         "netd.o",
     ],
+    header_libs: ["bpf_connectivity_headers"],
     shared_libs: [
         "android.system.net.netd@1.0",
         "android.system.net.netd@1.1",
         "libbase",
         "libbinder",
-        "libbpf_android",
         "libcutils",
         "libdl",
         "libhidlbase",
@@ -128,6 +131,7 @@ cc_binary {
         "oemnetd_aidl_interface-cpp",
     ],
     static_libs: [
+        "libip_checksum",
         "libnetd_server",
     ],
     srcs: [
@@ -198,6 +202,7 @@ cc_test {
         "system/netd/server/binder",
         "system/netd/tests",
     ],
+    header_libs: ["bpf_connectivity_headers"],
     srcs: [
         "BandwidthControllerTest.cpp",
         "ClatdControllerTest.cpp",
@@ -219,6 +224,7 @@ cc_test {
     ],
     static_libs: [
         "libgmock",
+        "libip_checksum",
         "libnetd_server",
         "libnetd_test_tun_interface",
         "libqtaguid",
@@ -228,7 +234,6 @@ cc_test {
     shared_libs: [
         "libbase",
         "libbinder",
-        "libbpf_android",
         "libcrypto",
         "libcutils",
         "liblog",
