@@ -73,14 +73,12 @@ cc_library_static {
     shared_libs: [
         "libbase",
         "libbinder",
-        "libnetdbpf",
         "libnetutils",
         "libnetdutils",
         "libpcap",
-        "libqtaguid",
         "libssl",
         "libsysutils",
-        "netd_aidl_interface-V7-cpp",
+        "netd_aidl_interface-V8-cpp",
         "netd_event_listener_interface-V1-cpp",
     ],
     static_libs: [
@@ -122,11 +120,10 @@ cc_binary {
         "libnetutils",
         "libpcap",
         "libprocessgroup",
-        "libqtaguid",
         "libselinux",
         "libsysutils",
         "libutils",
-        "netd_aidl_interface-V7-cpp",
+        "netd_aidl_interface-V8-cpp",
         "netd_event_listener_interface-V1-cpp",
         "oemnetd_aidl_interface-cpp",
     ],
@@ -179,7 +176,7 @@ cc_binary {
         "libutils",
         "libbinder",
         "dnsresolver_aidl_interface-V7-cpp",
-        "netd_aidl_interface-V6-cpp",
+        "netd_aidl_interface-V6-cpp", // ndc is going to be deprecated. Keep it in v6 is enough.
     ],
     srcs: [
         "ndc.cpp",
@@ -227,8 +224,7 @@ cc_test {
         "libip_checksum",
         "libnetd_server",
         "libnetd_test_tun_interface",
-        "libqtaguid",
-        "netd_aidl_interface-V7-cpp",
+        "netd_aidl_interface-V8-cpp",
         "netd_event_listener_interface-V1-cpp",
     ],
     shared_libs: [
