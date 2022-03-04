@@ -32,7 +32,6 @@ filegroup {
         "TcUtils.cpp",
         "SockDiag.cpp",
         "XfrmController.cpp",
-        "TrafficController.cpp",
     ],
 }
 
@@ -63,7 +62,6 @@ cc_library_static {
         "StrictController.cpp",
         "TcpSocketMonitor.cpp",
         "TetherController.cpp",
-        "TrafficController.cpp",
         "UidRanges.cpp",
         "WakeupController.cpp",
         "XfrmController.cpp",
@@ -196,6 +194,11 @@ cc_test {
         "system/netd/tests",
     ],
     header_libs: ["bpf_connectivity_headers"],
+    tidy_timeout_srcs: [
+        "BandwidthControllerTest.cpp",
+        "InterfaceControllerTest.cpp",
+        "XfrmControllerTest.cpp",
+    ],
     srcs: [
         "BandwidthControllerTest.cpp",
         "ClatdControllerTest.cpp",
@@ -211,7 +214,6 @@ cc_test {
         "SockDiagTest.cpp",
         "StrictControllerTest.cpp",
         "TetherControllerTest.cpp",
-        "TrafficControllerTest.cpp",
         "XfrmControllerTest.cpp",
         "WakeupControllerTest.cpp",
     ],
