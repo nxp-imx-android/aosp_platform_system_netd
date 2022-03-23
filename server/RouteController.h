@@ -16,8 +16,9 @@
 
 #pragma once
 
-#include "NetdConstants.h"  // IptablesTarget
-#include "Network.h"        // UidRangeMap
+#include "InterfaceController.h"  // getParameter
+#include "NetdConstants.h"        // IptablesTarget
+#include "Network.h"              // UidRangeMap
 #include "Permission.h"
 
 #include <android-base/thread_annotations.h>
@@ -77,6 +78,13 @@ constexpr int32_t RULE_PRIORITY_UID_DEFAULT_UNREACHABLE           = 29000;
 constexpr int32_t RULE_PRIORITY_DEFAULT_NETWORK                   = 30000;
 constexpr int32_t RULE_PRIORITY_UNREACHABLE                       = 32000;
 // clang-format on
+
+constexpr const char* LOCAL_EXCLUSION_ROUTES_V4[] = {
+        "169.254.0.0/16",  // Link-local, RFC3927
+};
+constexpr const char* LOCAL_EXCLUSION_ROUTES_V6[] = {
+        "fe80::/10"  // Link-local, RFC-4291
+};
 
 class UidRanges;
 
@@ -219,7 +227,10 @@ public:
                                     const UidRangeMap& uidRangeMap, bool secure, bool add,
                                     bool modifyNonUidBasedRules, bool excludeLocalRoutes);
     static void updateTableNamesFile() EXCLUDES(sInterfaceToTableLock);
-    static int modifyVpnLocalExclusionRule(uint16_t action, const char* physicalInterface);
+    static int modifyVpnLocalExclusionRule(bool add, const char* physicalInterface);
+    static int modifyVpnLocalExclusionRoutes(bool add, const char* interface);
+    static int modifyVpnLocalExclusionRoute(bool add, const char* interface,
+                                            const char* destination);
 };
 
 // Public because they are called by by RouteControllerTest.cpp.
